@@ -1,20 +1,18 @@
+# 工程杂项
 .idea/
 __pycache__/
 build/
 dist/
-mvector.egg-info/
-log/
-test.py
-dataset/
-audio_db/
-output/
-models/*.txt
-*.wav
-# text/audio
+*.egg-info/
+.ipynb_checkpoints/
+
+# 原始文本/音频（不要）
 *.txt
 *.wav
+*.flac
+*.mp3
 
-# archives
+# 压缩包（不要）
 *.zip
 *.tar
 *.tar.gz
@@ -25,9 +23,7 @@ models/*.txt
 *.bz2
 *.xz
 
-# caches & artifacts
-__pycache__/
-*.log
+# 模型/二进制权重（不要）
 *.pt
 *.ckpt
 *.onnx
@@ -35,14 +31,29 @@ __pycache__/
 *.npz
 *.pkl
 *.pickle
-.ipynb_checkpoints/
-output/
-data/
-datasets/
+
+# 办公文档（不要）
+*.doc
+*.docx
+*.ppt
+*.pptx
+*.xls
+*.xlsx
+
+# 目录中间产物（保留目录结构，但默认不跟踪文件）
 checkpoints/
-*.txt
-*.wav
-*.zip
-*.7z
-*.rar
-output/
+log/
+output/**
+data/**
+datasets/**
+
+# 允许在上述目录里保留的元数据（白名单）——json与图片
+!output/
+!data/
+!datasets/
+!output/**/*.json
+!data/**/*.json
+!datasets/**/*.json
+!output/**/*.{png,jpg,jpeg,gif,svg,webp,bmp}
+!data/**/*.{png,jpg,jpeg,gif,svg,webp,bmp}
+!datasets/**/*.{png,jpg,jpeg,gif,svg,webp,bmp}

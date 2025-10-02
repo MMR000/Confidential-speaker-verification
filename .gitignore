@@ -1,0 +1,42 @@
+.idea/
+__pycache__/
+build/
+dist/
+mvector.egg-info/
+log/
+test.py
+dataset/
+audio_db/
+output/
+models/*.txt
+*.wav
+# text/audio
+*.txt
+*.wav
+
+# archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.gz
+*.bz2
+*.xz
+
+# caches & artifacts
+__pycache__/
+*.log
+*.pt
+*.ckpt
+*.onnx
+*.npy
+*.npz
+*.pkl
+*.pickle
+.ipynb_checkpoints/
+output/
+data/
+datasets/
+checkpoints/

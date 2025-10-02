@@ -1,0 +1,264 @@
+(demo) mmr@ddd:~/MamyrModel/VoiceprintRecognition-Pytorch-develop$ export PROJ=/home/mmr/MamyrModel/VoiceprintRecognition-Pytorch-develop
+export CFG=$PROJ/configs/cam++.yml
+export MODEL=$PROJ/models/CAMPPlus_Fbank/best_model
+export VOX1_DEV=$PROJ/vox1_dev_wav/wav
+export VOX1_TEST=$PROJ/vox1_test_wav/wav
+export T_O=$PROJ/O.txt
+export CACHE=$PROJ/output/cache_emb
+
+python $PROJ/ppsv_runner.py \
+  --configs $CFG --model_path $MODEL --use_gpu true \
+  --search_dirs $VOX1_DEV $VOX1_TEST \
+  --dev_search_dirs $VOX1_DEV $VOX1_TEST \
+  --dev_trials $T_O --trials $T_O \
+  --report_dir $PROJ/output/report_vox1_O_devO_testO \
+  --save_scores $PROJ/output/report_vox1_O_devO_testO/scores_cosine.txt \
+  --baselines cosine euclid lda plda \
+  --use_cache true --cache_dir $CACHE \
+  --det_probit \
+  --fp_kbits 16 --fp_alpha_pow2 10 --fp_trunc_sigma 10 \
+  --auto_tau
+
+[STAGE] ▶ 加载模型 ...
+[2025-09-12 12:00:01.231059 INFO   ] utils:print_arguments:18 - ----------- 配置文件参数 -----------
+[2025-09-12 12:00:01.231145 INFO   ] utils:print_arguments:21 - dataset_conf:
+[2025-09-12 12:00:01.231183 INFO   ] utils:print_arguments:24 -         aug_conf:
+[2025-09-12 12:00:01.231214 INFO   ] utils:print_arguments:26 -                 noise_aug_prob: 0.2
+[2025-09-12 12:00:01.231243 INFO   ] utils:print_arguments:26 -                 noise_dir: dataset/noise
+[2025-09-12 12:00:01.231269 INFO   ] utils:print_arguments:26 -                 speed_perturb: True
+[2025-09-12 12:00:01.231293 INFO   ] utils:print_arguments:26 -                 speed_perturb_3_class: True
+[2025-09-12 12:00:01.231320 INFO   ] utils:print_arguments:26 -                 volume_aug_prob: 0.2
+[2025-09-12 12:00:01.231351 INFO   ] utils:print_arguments:26 -                 volume_perturb: False
+[2025-09-12 12:00:01.231376 INFO   ] utils:print_arguments:24 -         dataLoader:
+[2025-09-12 12:00:01.231400 INFO   ] utils:print_arguments:26 -                 batch_size: 128
+[2025-09-12 12:00:01.231421 INFO   ] utils:print_arguments:26 -                 num_workers: 4
+[2025-09-12 12:00:01.231442 INFO   ] utils:print_arguments:28 -         do_vad: False
+[2025-09-12 12:00:01.231463 INFO   ] utils:print_arguments:28 -         enroll_list: dataset/enroll_list.txt
+[2025-09-12 12:00:01.231484 INFO   ] utils:print_arguments:24 -         eval_conf:
+[2025-09-12 12:00:01.231504 INFO   ] utils:print_arguments:26 -                 batch_size: 1
+[2025-09-12 12:00:01.231524 INFO   ] utils:print_arguments:26 -                 max_duration: 20
+[2025-09-12 12:00:01.231545 INFO   ] utils:print_arguments:28 -         max_duration: 3
+[2025-09-12 12:00:01.231567 INFO   ] utils:print_arguments:28 -         min_duration: 0.5
+[2025-09-12 12:00:01.231588 INFO   ] utils:print_arguments:28 -         sample_rate: 16000
+[2025-09-12 12:00:01.231608 INFO   ] utils:print_arguments:24 -         spec_aug_args:
+[2025-09-12 12:00:01.231630 INFO   ] utils:print_arguments:26 -                 freq_mask_width: [0, 8]
+[2025-09-12 12:00:01.231651 INFO   ] utils:print_arguments:26 -                 time_mask_width: [0, 10]
+[2025-09-12 12:00:01.231671 INFO   ] utils:print_arguments:28 -         target_dB: -20
+[2025-09-12 12:00:01.231692 INFO   ] utils:print_arguments:28 -         train_list: dataset/train_list.txt
+[2025-09-12 12:00:01.231711 INFO   ] utils:print_arguments:28 -         trials_list: dataset/trials_list.txt
+[2025-09-12 12:00:01.231730 INFO   ] utils:print_arguments:28 -         use_dB_normalization: True
+[2025-09-12 12:00:01.231750 INFO   ] utils:print_arguments:28 -         use_spec_aug: True
+[2025-09-12 12:00:01.231769 INFO   ] utils:print_arguments:21 - loss_conf:
+[2025-09-12 12:00:01.231790 INFO   ] utils:print_arguments:24 -         args:
+[2025-09-12 12:00:01.231811 INFO   ] utils:print_arguments:26 -                 easy_margin: False
+[2025-09-12 12:00:01.231831 INFO   ] utils:print_arguments:26 -                 margin: 0.2
+[2025-09-12 12:00:01.231852 INFO   ] utils:print_arguments:26 -                 scale: 32
+[2025-09-12 12:00:01.231872 INFO   ] utils:print_arguments:24 -         margin_scheduler_args:
+[2025-09-12 12:00:01.231893 INFO   ] utils:print_arguments:26 -                 final_margin: 0.3
+[2025-09-12 12:00:01.231912 INFO   ] utils:print_arguments:28 -         use_loss: AAMLoss
+[2025-09-12 12:00:01.231936 INFO   ] utils:print_arguments:28 -         use_margin_scheduler: True
+[2025-09-12 12:00:01.231955 INFO   ] utils:print_arguments:21 - model_conf:
+[2025-09-12 12:00:01.231975 INFO   ] utils:print_arguments:24 -         backbone:
+[2025-09-12 12:00:01.231995 INFO   ] utils:print_arguments:26 -                 embd_dim: 192
+[2025-09-12 12:00:01.232014 INFO   ] utils:print_arguments:24 -         classifier:
+[2025-09-12 12:00:01.232033 INFO   ] utils:print_arguments:26 -                 num_blocks: 0
+[2025-09-12 12:00:01.232052 INFO   ] utils:print_arguments:26 -                 num_speakers: 2796
+[2025-09-12 12:00:01.232072 INFO   ] utils:print_arguments:21 - optimizer_conf:
+[2025-09-12 12:00:01.232092 INFO   ] utils:print_arguments:28 -         learning_rate: 0.001
+[2025-09-12 12:00:01.232112 INFO   ] utils:print_arguments:28 -         optimizer: Adam
+[2025-09-12 12:00:01.232131 INFO   ] utils:print_arguments:28 -         scheduler: WarmupCosineSchedulerLR
+[2025-09-12 12:00:01.232150 INFO   ] utils:print_arguments:24 -         scheduler_args:
+[2025-09-12 12:00:01.232170 INFO   ] utils:print_arguments:26 -                 max_lr: 0.001
+[2025-09-12 12:00:01.232191 INFO   ] utils:print_arguments:26 -                 min_lr: 1e-05
+[2025-09-12 12:00:01.232210 INFO   ] utils:print_arguments:26 -                 warmup_epoch: 5
+[2025-09-12 12:00:01.232230 INFO   ] utils:print_arguments:28 -         weight_decay: 1e-05
+[2025-09-12 12:00:01.232249 INFO   ] utils:print_arguments:21 - preprocess_conf:
+[2025-09-12 12:00:01.232270 INFO   ] utils:print_arguments:28 -         feature_method: Fbank
+[2025-09-12 12:00:01.232290 INFO   ] utils:print_arguments:24 -         method_args:
+[2025-09-12 12:00:01.232310 INFO   ] utils:print_arguments:26 -                 num_mel_bins: 80
+[2025-09-12 12:00:01.232329 INFO   ] utils:print_arguments:26 -                 sample_frequency: 16000
+[2025-09-12 12:00:01.232348 INFO   ] utils:print_arguments:21 - train_conf:
+[2025-09-12 12:00:01.232368 INFO   ] utils:print_arguments:28 -         enable_amp: True
+[2025-09-12 12:00:01.232387 INFO   ] utils:print_arguments:28 -         log_interval: 100
+[2025-09-12 12:00:01.232407 INFO   ] utils:print_arguments:28 -         max_epoch: 60
+[2025-09-12 12:00:01.232426 INFO   ] utils:print_arguments:28 -         use_compile: False
+[2025-09-12 12:00:01.232446 INFO   ] utils:print_arguments:30 - use_model: CAMPPlus
+[2025-09-12 12:00:01.232466 INFO   ] utils:print_arguments:31 - ------------------------------------------------
+成功加载模型参数：/home/mmr/MamyrModel/VoiceprintRecognition-Pytorch-develop/models/CAMPPlus_Fbank/best_model/model.pth
+[MODEL] 成功加载嵌入模型。
+[STAGE] ■ 加载模型 完成，用时 248.1ms
+
+
+[STAGE] ▶ 索引(test) ...
+索引(目录): 100%|███████████████████████████████████████| 153516/153516 [00:00<00:00, 163266.39it/s]
+[INDEX-DIRS] 文件总数=153516，映射键=612688
+聚合说话人: 100%|██████████████████████████████████████| 612688/612688 [00:00<00:00, 1441331.94it/s]
+[INDEX-MERGED(test)] 键=612688，说话人=1251
+[STAGE] ■ 索引(test) 完成，用时 1.6s
+
+
+[STAGE] ▶ 索引(dev) ...
+索引(目录): 100%|███████████████████████████████████████| 153516/153516 [00:00<00:00, 158208.89it/s]
+[INDEX-DIRS] 文件总数=153516，映射键=612688
+[INDEX-MERGED(dev)] 键=612688，说话人=0
+[STAGE] ■ 索引(dev) 完成，用时 1.1s
+
+
+[STAGE] ▶ 准备trials(test) ...
+载入trials: 100%|██████████████████████████████████████████| 37611/37611 [00:00<00:00, 86273.60it/s]
+[TRIALS] 总行=37611，采纳=37611，跳过=0，全部有标签
+[STAGE] ■ 准备trials(test) 完成，用时 437.7ms
+
+
+[STAGE] ▶ 准备trials(dev) ...
+载入trials: 100%|██████████████████████████████████████████| 37611/37611 [00:00<00:00, 87404.43it/s]
+[TRIALS] 总行=37611，采纳=37611，跳过=0，全部有标签
+[STAGE] ■ 准备trials(dev) 完成，用时 432.0ms
+
+
+[STAGE] ▶ 明文评测(test) ...
+
+[STAGE] ▶ 嵌入提取(test) ...
+嵌入提取: 100%|████████████████████████████████████████████████| 4708/4708 [00:09<00:00, 487.56it/s]
+[STAGE] ■ 嵌入提取(test) 完成，用时 9.7s
+
+score(cosine): 100%|█████████████████████████████████████| 37611/37611 [00:00<00:00, 2048726.85it/s]
+
+[STAGE] ▶ 评测与作图(test) ...
+[EVAL] pairs=37611，score均值=0.436265，std=0.225505
+[SAVE] 分数：/home/mmr/MamyrModel/VoiceprintRecognition-Pytorch-develop/output/report_vox1_O_devO_testO/scores_cosine.txt
+EER扫描: 100%|█████████████████████████████████████████████| 37238/37238 [00:02<00:00, 12515.77it/s]
+[METRICS] tau(EER)=0.4367，EER=0.11552，minDCF=0.00741
+ROC阈值: 100%|███████████████████████████████████████████████| 2048/2048 [00:00<00:00, 11606.03it/s]
+EER扫描: 100%|█████████████████████████████████████████████| 37238/37238 [00:03<00:00, 11327.80it/s]
+PR阈值: 100%|████████████████████████████████████████████████| 2048/2048 [00:00<00:00, 12129.52it/s]
+[METRICS] AUC=0.95801
+[POINTS] @EER   tau=0.4367  -> FAR=0.1155, FRR=0.1156, ACC=0.8844
+[POINTS] @FAR1% tau=0.9992 -> FAR=0.0000, FRR=0.9999, ACC=0.5001
+[POINTS] @FAR0.1% tau=0.9992 -> FAR=0.0000, FRR=0.9999, ACC=0.5001
+bootstrap(pairs): 100%|█████████████████████████████████████████| 1000/1000 [34:50<00:00,  2.09s/it]
+bootstrap(spk): 100%|███████████████████████████████████████████| 1000/1000 [33:01<00:00,  1.98s/it]
+[BOOT(pairs)]   EER mean=0.1155, 95% CI=(0.1124, 0.1188)
+[BOOT(pairs)]   AUC mean=0.9580, 95% CI=(0.9563, 0.9597)
+[BOOT(speaker)] EER 95% CI=(0.1048, 0.1249)
+[BOOT(speaker)] AUC 95% CI=(0.9514, 0.9650)
+[SAVE] 指标：/home/mmr/MamyrModel/VoiceprintRecognition-Pytorch-develop/output/report_vox1_O_devO_testO/metrics.json
+[STAGE] ■ 评测与作图(test) 完成，用时 1h8m1s
+
+[EVAL] 使用 test 集 EER 阈值：0.4367
+[STAGE] ■ 明文评测(test) 完成，用时 1h8m10s
+
+
+[STAGE] ▶ 固定点评测(dev->test) ...
+嵌入提取: 100%|██████████████████████████████████████████████| 4708/4708 [00:00<00:00, 31498.39it/s]
+fixed-point打分: 100%|████████████████████████████████████| 37611/37611 [00:00<00:00, 141657.93it/s]
+EER扫描: 100%|███████████████████████████████████████████████| 1100/1100 [00:00<00:00, 12276.74it/s]
+[FIXED-POINT(dev)] EER=0.1155 tau_EER=447.2729 tau_1%=1023.0000 tau_0.1%=1023.0000
+嵌入提取: 100%|██████████████████████████████████████████████| 4708/4708 [00:00<00:00, 32272.26it/s]
+fixed-point打分: 100%|████████████████████████████████████| 37611/37611 [00:00<00:00, 141247.86it/s]
+[SAVE] 指标：/home/mmr/MamyrModel/VoiceprintRecognition-Pytorch-develop/output/report_vox1_O_devO_testO/metrics_fixedpoint_devcal.json
+[STAGE] ■ 固定点评测(dev->test) 完成，用时 996.1ms
+
+
+[STAGE] ▶ 基线/消融 ...
+嵌入提取: 100%|██████████████████████████████████████████████| 4708/4708 [00:00<00:00, 32030.78it/s]
+
+[STAGE] ▶ 嵌入/变换(基线) ...
+嵌入提取: 100%|██████████████████████████████████████████████| 4708/4708 [00:00<00:00, 32175.56it/s]
+[STAGE] ■ 嵌入/变换(基线) 完成，用时 146.5ms
+
+score(cosine): 100%|█████████████████████████████████████| 37611/37611 [00:00<00:00, 1099087.07it/s]
+[EVAL] pairs=37611，score均值=0.436265，std=0.225505
+[SAVE] 分数：/home/mmr/MamyrModel/VoiceprintRecognition-Pytorch-develop/output/report_vox1_O_devO_testO/scores_cosine.txt
+EER扫描: 100%|█████████████████████████████████████████████| 37240/37240 [00:02<00:00, 12414.15it/s]
+[METRICS] tau(EER)=0.4367，EER=0.11552，minDCF=0.00741
+ROC阈值: 100%|███████████████████████████████████████████████| 2048/2048 [00:00<00:00, 12227.00it/s]
+EER扫描: 100%|█████████████████████████████████████████████| 37240/37240 [00:03<00:00, 11145.79it/s]
+PR阈值: 100%|████████████████████████████████████████████████| 2048/2048 [00:00<00:00, 12057.13it/s]
+[METRICS] AUC=0.95801
+[POINTS] @EER   tau=0.4367  -> FAR=0.1155, FRR=0.1156, ACC=0.8844
+[POINTS] @FAR1% tau=0.9992 -> FAR=0.0000, FRR=0.9999, ACC=0.5001
+[POINTS] @FAR0.1% tau=0.9992 -> FAR=0.0000, FRR=0.9999, ACC=0.5001
+bootstrap(pairs): 100%|█████████████████████████████████████████| 1000/1000 [37:56<00:00,  2.28s/it]
+bootstrap(spk): 100%|███████████████████████████████████████████| 1000/1000 [33:31<00:00,  2.01s/it]
+[BOOT(pairs)]   EER mean=0.1155, 95% CI=(0.1124, 0.1188)
+[BOOT(pairs)]   AUC mean=0.9580, 95% CI=(0.9563, 0.9597)
+[BOOT(speaker)] EER 95% CI=(0.1048, 0.1249)
+[BOOT(speaker)] AUC 95% CI=(0.9514, 0.9650)
+[SAVE] 指标：/home/mmr/MamyrModel/VoiceprintRecognition-Pytorch-develop/output/report_vox1_O_devO_testO/metrics_cosine.json
+score(euclid): 100%|██████████████████████████████████████| 37611/37611 [00:00<00:00, 888718.45it/s]
+[EVAL] pairs=37611，score均值=-1.036599，std=0.230069
+[SAVE] 分数：/home/mmr/MamyrModel/VoiceprintRecognition-Pytorch-develop/output/report_vox1_O_devO_testO/scores_euclid.txt
+EER扫描: 100%|█████████████████████████████████████████████| 37185/37185 [00:02<00:00, 12405.03it/s]
+[METRICS] tau(EER)=-1.0614，EER=0.11552，minDCF=0.00741
+ROC阈值: 100%|███████████████████████████████████████████████| 2048/2048 [00:00<00:00, 10705.20it/s]
+EER扫描: 100%|█████████████████████████████████████████████| 37185/37185 [00:02<00:00, 12691.40it/s]
+PR阈值: 100%|████████████████████████████████████████████████| 2048/2048 [00:00<00:00, 12214.09it/s]
+[METRICS] AUC=0.95801
+[POINTS] @EER   tau=-1.0614  -> FAR=0.1155, FRR=0.1156, ACC=0.8844
+[POINTS] @FAR1% tau=-0.0403 -> FAR=0.0000, FRR=0.9999, ACC=0.5001
+[POINTS] @FAR0.1% tau=-0.0403 -> FAR=0.0000, FRR=0.9999, ACC=0.5001
+bootstrap(pairs): 100%|█████████████████████████████████████████| 1000/1000 [34:20<00:00,  2.06s/it]
+bootstrap(spk): 100%|███████████████████████████████████████████| 1000/1000 [32:22<00:00,  1.94s/it]
+[BOOT(pairs)]   EER mean=0.1155, 95% CI=(0.1124, 0.1188)
+[BOOT(pairs)]   AUC mean=0.9580, 95% CI=(0.9563, 0.9597)
+[BOOT(speaker)] EER 95% CI=(0.1048, 0.1249)
+[BOOT(speaker)] AUC 95% CI=(0.9514, 0.9650)
+[SAVE] 指标：/home/mmr/MamyrModel/VoiceprintRecognition-Pytorch-develop/output/report_vox1_O_devO_testO/metrics_euclid.json
+[BASELINE] LDA 跳过。
+score(plda): 100%|████████████████████████████████████████| 37611/37611 [00:00<00:00, 145176.22it/s]
+[EVAL] pairs=37611，score均值=108.774208，std=25.906431
+[SAVE] 分数：/home/mmr/MamyrModel/VoiceprintRecognition-Pytorch-develop/output/report_vox1_O_devO_testO/scores_plda.txt
+EER扫描: 100%|█████████████████████████████████████████████| 37486/37486 [00:03<00:00, 12480.84it/s]
+[METRICS] tau(EER)=105.4519，EER=0.31297，minDCF=0.00937
+ROC阈值: 100%|███████████████████████████████████████████████| 2048/2048 [00:00<00:00, 12800.53it/s]
+EER扫描: 100%|█████████████████████████████████████████████| 37486/37486 [00:03<00:00, 12287.31it/s]
+PR阈值: 100%|████████████████████████████████████████████████| 2048/2048 [00:00<00:00, 12450.28it/s]
+[METRICS] AUC=0.76136
+[POINTS] @EER   tau=105.4519  -> FAR=0.3129, FRR=0.3129, ACC=0.6871
+[POINTS] @FAR1% tau=379.0430 -> FAR=0.0000, FRR=0.9999, ACC=0.5001
+[POINTS] @FAR0.1% tau=379.0430 -> FAR=0.0000, FRR=0.9999, ACC=0.5001
+bootstrap(pairs): 100%|█████████████████████████████████████████| 1000/1000 [35:37<00:00,  2.14s/it]
+bootstrap(spk): 100%|███████████████████████████████████████████| 1000/1000 [32:28<00:00,  1.95s/it]
+[BOOT(pairs)]   EER mean=0.3131, 95% CI=(0.3085, 0.3177)
+[BOOT(pairs)]   AUC mean=0.7614, 95% CI=(0.7568, 0.7661)
+[BOOT(speaker)] EER 95% CI=(0.2970, 0.3251)
+[BOOT(speaker)] AUC 95% CI=(0.7468, 0.7785)
+[SAVE] 指标：/home/mmr/MamyrModel/VoiceprintRecognition-Pytorch-develop/output/report_vox1_O_devO_testO/metrics_plda.json
+[STAGE] ■ 基线/消融 完成，用时 3h26m47s
+
+
+[STAGE] ▶ 错盐不可链接 ...
+[STAGE] ■ 错盐不可链接 完成，用时 0.0ms
+
+
+[STAGE] ▶ 鲁棒性(噪声/截断) ...
+[STAGE] ■ 鲁棒性(噪声/截断) 完成，用时 0.0ms
+
+
+[STAGE] ▶ 规模扩展(EER~#spk) ...
+[STAGE] ■ 规模扩展(EER~#spk) 完成，用时 0.0ms
+
+
+[STAGE] ▶ 嵌入计时(profile) ...
+[STAGE] ■ 嵌入计时(profile) 完成，用时 0.0ms
+
+
+[STAGE] ▶ MPC匹配压测+图 ...
+[STAGE] ■ MPC匹配压测+图 完成，用时 0.0ms
+
+
+[STAGE] ▶ 单次匹配 ...
+[STAGE] ■ 单次匹配 完成，用时 0.0ms
+
+
+[STAGE] ▶ PAD(可选) ...
+[STAGE] ■ PAD(可选) 完成，用时 0.0ms
+
+
+[STAGE] ▶ 保存元数据/计时 ...
+[SAVE] JSON：/home/mmr/MamyrModel/VoiceprintRecognition-Pytorch-develop/output/report_vox1_O_devO_testO/run_metadata.json
+[STAGE] 计时统计已写入：
+  - /home/mmr/MamyrModel/VoiceprintRecognition-Pytorch-develop/output/report_vox1_O_devO_testO/stage_times.json
+  - /home/mmr/MamyrModel/VoiceprintRecognition-Pytorch-develop/output/report_vox1_O_devO_testO/stage_times.txt
+[STAGE] ■ 保存元数据/计时 完成，用时 3.9ms

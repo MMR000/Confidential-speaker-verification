@@ -40,3 +40,9 @@ output/
 data/
 datasets/
 checkpoints/
+*.txt
+*.wav
+*.zip
+*.7z
+*.rar
+output/

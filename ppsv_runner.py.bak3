@@ -1,0 +1,1813 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Privacy-Preserving Speaker Verification "runner"
+- 全流程进度条 + ETA（tqdm）
+- 阶段计时统计（JSON + 文本）
+- 可扩展到 20k 对（默认 max_pairs=20000）
+- 明文/固定点/错盐/鲁棒性/规模扩展/基线/延迟CDF/通信条形图/MPC匹配压测
+- PAD 与 t-DCF 默认不跑
+
+依赖：
+  pip install -U numpy tqdm matplotlib scikit-learn scipy soundfile librosa
+  # 可选（MPC demo）：
+  pip install torch  # 根据 CUDA 情况选择
+  pip install crypten
+
+你自己的嵌入模型：
+  from mvector.predict import MVectorPredictor
+  # 确保 configs 和 model_path 有效
+"""
+import os, sys, time, math, argparse, csv, random, hashlib, tempfile, platform, json
+from typing import List, Tuple, Dict, Optional
+
+import numpy as np
+
+# -----------------------------
+# 依赖探测
+# -----------------------------
+HAS_TQDM = False
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except Exception:
+    pass
+
+HAS_MPL = False
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except Exception:
+    pass
+
+HAS_SK = False
+try:
+    from sklearn.decomposition import PCA
+    from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
+    HAS_SK = True
+except Exception:
+    HAS_SK = False
+
+HAS_AUDIO = False
+try:
+    import soundfile as sf
+    import librosa
+    HAS_AUDIO = True
+except Exception:
+    pass
+
+HAS_SCIPY = False
+try:
+    from scipy.stats import norm
+    HAS_SCIPY = True
+except Exception:
+    pass
+
+# 可选：PAD（默认不跑）
+HAS_PAD = False
+PADPredictor = None
+try:
+    from mvector.pad import PADPredictor as _PADPredictor
+    PADPredictor = _PADPredictor
+    HAS_PAD = True
+except Exception:
+    HAS_PAD = False
+    PADPredictor = None
+
+# 你的嵌入预测器
+from mvector.predict import MVectorPredictor
+
+
+# -----------------------------
+# 全局工具：阶段计时器 + 进度条包装
+# -----------------------------
+STAGE_TIMES: Dict[str, float] = {}
+def fmt_sec(x: float) -> str:
+    if x < 1: return f"{x*1000:.1f}ms"
+    m, s = divmod(int(x), 60); h, m = divmod(m, 60)
+    if h: return f"{h}h{m}m{s}s"
+    if m: return f"{m}m{s}s"
+    return f"{x:.1f}s"
+
+class StageTimer:
+    def __init__(self, name: str):
+        self.name = name
+        self.t0 = None
+    def __enter__(self):
+        self.t0 = time.time()
+        print(f"\n[STAGE] ▶ {self.name} ...")
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        dt = time.time() - (self.t0 or time.time())
+        STAGE_TIMES[self.name] = dt
+        print(f"[STAGE] ■ {self.name} 完成，用时 {fmt_sec(dt)}\n")
+
+def pb_iter(it, desc="", total: Optional[int]=None):
+    if HAS_TQDM:
+        return tqdm(it, desc=desc, ncols=100, total=total)
+    else:
+        return it
+
+def save_stage_times(report_dir: str):
+    os.makedirs(report_dir, exist_ok=True)
+    jpath = os.path.join(report_dir, "stage_times.json")
+    with open(jpath, "w", encoding="utf-8") as f:
+        json.dump({k: float(v) for k, v in STAGE_TIMES.items()}, f, ensure_ascii=False, indent=2)
+    tpath = os.path.join(report_dir, "stage_times.txt")
+    with open(tpath, "w", encoding="utf-8") as f:
+        w = max(len(k) for k in STAGE_TIMES) if STAGE_TIMES else 8
+        f.write("Stage".ljust(w) + " | Time\n")
+        f.write("-"*w + "-|-------\n")
+        for k, v in STAGE_TIMES.items():
+            f.write(k.ljust(w) + " | " + fmt_sec(v) + "\n")
+    print(f"[STAGE] 计时统计已写入：\n  - {jpath}\n  - {tpath}")
+
+# -----------------------------
+# 杂项工具
+# -----------------------------
+AUDIO_EXTS = (".wav", ".flac", ".mp3", ".m4a", ".ogg", ".WAV", ".FLAC", ".MP3", ".M4A", ".OGG")
+
+def ensure_dir(p: str):
+    if p:
+        os.makedirs(p, exist_ok=True)
+
+def parse_label(tok: str) -> Optional[int]:
+    t = tok.strip().lower()
+    pos = {"1","true","yes","y","t","same","target","genuine","bonafide","bona-fide"}
+    neg = {"0","false","no","n","f","diff","different","nontarget","imposter","impostor","spoof"}
+    if t in pos: return 1
+    if t in neg: return 0
+    return None
+
+def normpath(p: str) -> str:
+    return os.path.normpath(p).replace("\\", "/")
+
+def sha_to_rng(s: str, d: int) -> np.ndarray:
+    h = hashlib.sha256(s.encode("utf-8")).digest()
+    seed = int.from_bytes(h[:8], "little", signed=False)
+    rng = np.random.default_rng(seed)
+    return rng.standard_normal(d).astype(np.float32)
+
+def save_json(path: str, obj: dict):
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    print(f"[SAVE] JSON：{path}")
+
+def save_metrics_json(report_dir: str, metrics: dict, tag: Optional[str] = None):
+    ensure_dir(report_dir or "output/report")
+    suffix = "" if not tag else tag
+    fpath = os.path.join(report_dir or "output/report", f"metrics{suffix}.json")
+    try:
+        with open(fpath, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=2)
+        print(f"[SAVE] 指标：{fpath}")
+    except Exception as e:
+        print(f"[WARN] 保存失败：{e}")
+
+def safe_hash_file(path: Optional[str]) -> Optional[str]:
+    if not path: return None
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                b = f.read(1<<20)
+                if not b: break
+                h.update(b)
+        return h.hexdigest()[:16]
+    except Exception:
+        return None
+
+# -----------------------------
+# 目录索引（带总数计数 + 进度条）
+# -----------------------------
+def _count_audio_files(root_abs: str) -> int:
+    total = 0
+    for dirpath, _, filenames in os.walk(root_abs):
+        for fn in filenames:
+            if fn.endswith(AUDIO_EXTS):
+                total += 1
+    return total
+
+def build_audio_index_from_dirs(search_dirs: List[str]) -> Dict[str, str]:
+    index: Dict[str, str] = {}
+    uniq_roots = []
+    for d in (search_dirs or []):
+        if d and os.path.isdir(d):
+            ad = os.path.abspath(d)
+            if ad not in [os.path.abspath(x) for x in uniq_roots]:
+                uniq_roots.append(d)
+
+    total_files = 0
+    for r in uniq_roots:
+        total_files += _count_audio_files(os.path.abspath(r))
+    pbar = pb_iter(range(total_files), desc="索引(目录)", total=total_files) if HAS_TQDM else None
+
+    added = 0
+    for root in uniq_roots:
+        root_abs = os.path.abspath(root)
+        for dirpath, _, filenames in os.walk(root_abs):
+            for fn in filenames:
+                if not fn.endswith(AUDIO_EXTS):
+                    if pbar: pbar.update(1)
+                    continue
+                full = os.path.join(dirpath, fn)
+                rel = normpath(os.path.relpath(full, root_abs))
+                stem = os.path.splitext(fn)[0]
+                parent = os.path.basename(os.path.dirname(full))
+                keys = {
+                    fn, stem, f"{parent}/{fn}", f"{parent}/{stem}",
+                    rel, normpath(full)
+                }
+                for k in keys:
+                    index.setdefault(k, full)
+                added += 1
+                if pbar: pbar.update(1)
+    if pbar: pbar.close()
+    print(f"[INDEX-DIRS] 文件总数={total_files}，映射键={len(index)}")
+    return index
+
+# -----------------------------
+# validated.tsv 索引（带进度条）
+# -----------------------------
+def try_resolve_with_roots(path_token: str, roots: List[str]) -> Optional[str]:
+    if not path_token: return None
+    if os.path.isabs(path_token) and os.path.exists(path_token):
+        return path_token
+    for r in roots:
+        trial = os.path.join(r, path_token)
+        if os.path.exists(trial): return trial
+    for r in roots:
+        trial = os.path.join(r, "clips", path_token)
+        if os.path.exists(trial): return trial
+    return None
+
+def add_keys_for_path(index: Dict[str, str], client_id: str, path_token: str, abs_path: str):
+    fn = os.path.basename(abs_path)
+    stem = os.path.splitext(fn)[0]
+    parent = os.path.basename(os.path.dirname(abs_path))
+    keys = set()
+    if client_id: keys.add(client_id)
+    if path_token:
+        keys.add(path_token)
+        keys.add(os.path.splitext(path_token)[0])
+        keys.add(normpath(path_token))
+    keys.update({fn, stem, f"{parent}/{fn}", f"{parent}/{stem}", normpath(abs_path)})
+    for k in keys:
+        if k: index.setdefault(k, abs_path)
+
+def build_audio_index_from_validated(validated_tsv: str,
+                                     audio_root: Optional[str],
+                                     fallback_dirs: Optional[List[str]] = None
+                                     ) -> Tuple[Dict[str, str], Dict[str, List[str]], Dict[str, str]]:
+    index: Dict[str, str] = {}
+    spk2utts: Dict[str, List[str]] = {}
+    path2spk: Dict[str, str] = {}
+    if not validated_tsv or not os.path.isfile(validated_tsv):
+        return index, spk2utts, path2spk
+
+    roots = []
+    if audio_root and os.path.isdir(audio_root): roots.append(audio_root)
+    tsv_dir = os.path.dirname(os.path.abspath(validated_tsv))
+    if os.path.isdir(tsv_dir): roots.append(tsv_dir)
+
+    fb_index = build_audio_index_from_dirs(fallback_dirs or []) if fallback_dirs else {}
+
+    # 统计总行数以显示进度
+    total = sum(1 for _ in open(validated_tsv, "r", encoding="utf-8", errors="ignore"))
+    found, parsed = 0, 0
+    with open(validated_tsv, "r", encoding="utf-8", errors="ignore") as f:
+        # 允许无头
+        header = f.readline()
+        has_header = ("client_id" in header.lower() and "path" in header.lower())
+        f.seek(0)
+        it = pb_iter(f, desc="索引(TSV)", total=total) if HAS_TQDM else f
+        reader = csv.DictReader(it, delimiter="\t") if has_header else None
+
+        if reader:
+            for row in reader:
+                parsed += 1
+                cid = (row.get("client_id") or "").strip()
+                ptk = (row.get("path") or "").strip()
+                if not cid and not ptk: continue
+                abs_path = try_resolve_with_roots(ptk, roots) or fb_index.get(ptk) \
+                           or fb_index.get(os.path.splitext(ptk)[0]) or fb_index.get(normpath(ptk))
+                if abs_path and os.path.exists(abs_path):
+                    found += 1
+                    add_keys_for_path(index, cid, ptk, abs_path)
+                    spk2utts.setdefault(cid, []).append(abs_path)
+                    path2spk[abs_path] = cid
+        else:
+            for raw in it:
+                parsed += 1
+                line = raw.strip()
+                if not line: continue
+                parts = line.split("\t")
+                if len(parts) < 2: continue
+                cid, ptk = parts[0].strip(), parts[1].strip()
+                abs_path = try_resolve_with_roots(ptk, roots) or fb_index.get(ptk) \
+                           or fb_index.get(os.path.splitext(ptk)[0]) or fb_index.get(normpath(ptk))
+                if abs_path and os.path.exists(abs_path):
+                    found += 1
+                    add_keys_for_path(index, cid, ptk, abs_path)
+                    spk2utts.setdefault(cid, []).append(abs_path)
+                    path2spk[abs_path] = cid
+
+    print(f"[INDEX-TSV] 行={parsed}，成功解析={found}，键={len(index)}，说话人={len(spk2utts)}")
+    return index, spk2utts, path2spk
+
+
+# -----------------------------
+# trials（显式/自动，带进度条）
+# -----------------------------
+def load_trials_with_index(trials_path: str,
+                           index: Dict[str, str],
+                           base_hint: Optional[str] = None) -> Tuple[List[Tuple[str, str]], Optional[List[int]]]:
+    pairs: List[Tuple[str, str]] = []
+    labels: List[int] = []
+    base_dir = os.path.dirname(os.path.abspath(trials_path))
+    total = sum(1 for _ in open(trials_path, "r", encoding="utf-8", errors="ignore"))
+    it = pb_iter(open(trials_path, "r", encoding="utf-8", errors="ignore"), desc="载入trials", total=total) if HAS_TQDM \
+         else open(trials_path, "r", encoding="utf-8", errors="ignore")
+
+    def try_resolve(tok: str) -> Optional[str]:
+        tok = tok.strip()
+        if os.path.exists(tok): return tok
+        p1 = os.path.join(base_dir, tok)
+        if os.path.exists(p1): return p1
+        if base_hint:
+            p2 = os.path.join(base_hint, tok)
+            if os.path.exists(p2): return p2
+        for k in [tok, os.path.splitext(tok)[0], normpath(tok)]:
+            if k in index: return index[k]
+        return None
+
+    total, skipped, unlabeled = 0, 0, 0
+    for raw in it:
+        total += 1
+        line = raw.strip()
+        if not line or line.startswith("#"): continue
+        line = line.replace(",", " ").replace(";", " ").replace("\t", " ")
+        parts = [p for p in line.split() if p]
+        if len(parts) < 2:
+            skipped += 1
+            continue
+        cand_paths, cand_labels = [], []
+        for tok in parts:
+            lbl = parse_label(tok)
+            if lbl is not None:
+                cand_labels.append(lbl); continue
+            p = try_resolve(tok)
+            if p and os.path.exists(p): cand_paths.append(p)
+        if len(cand_paths) >= 2:
+            pairs.append((cand_paths[0], cand_paths[1]))
+            if cand_labels:
+                labels.append(int(cand_labels[-1]))
+            else:
+                unlabeled += 1
+        else:
+            skipped += 1
+    if HAS_TQDM: it.close()
+    labels_ret: Optional[List[int]] = None
+    if pairs and unlabeled == 0 and len(labels) == len(pairs):
+        labels_ret = labels
+    print(f"[TRIALS] 总行={total}，采纳={len(pairs)}，跳过={skipped}，"
+          f"{'全部有标签' if labels_ret is not None else '存在无标签'}")
+    return pairs, labels_ret
+
+def auto_generate_trials(spk2utts: Dict[str, List[str]],
+                         pos_per_spk: int = 5,
+                         neg_per_spk: int = 5,
+                         max_pairs: int = 20000,
+                         seed: int = 42) -> Tuple[List[Tuple[str, str]], List[int]]:
+    random.seed(seed)
+    pairs_set = set()
+    pairs: List[Tuple[str, str]] = []
+    labels: List[int] = []
+    speakers = [s for s in spk2utts.keys() if len(spk2utts[s]) >= 1]
+    speakers_with_2 = [s for s in spk2utts.keys() if len(spk2utts[s]) >= 2]
+    if len(speakers_with_2) == 0:
+        raise RuntimeError("没有任何拥有 >=2 条语音的说话人，无法生成正样本。")
+    # 正样本
+    total_pos = sum(min(pos_per_spk, max(0, len(spk2utts[spk])*(len(spk2utts[spk])-1)//2)) for spk in speakers_with_2)
+    pbar_pos = pb_iter(speakers_with_2, desc="生成正样本", total=len(speakers_with_2)) if HAS_TQDM else speakers_with_2
+    for spk in pbar_pos:
+        utts = list(spk2utts[spk])
+        random.shuffle(utts)
+        cand = []
+        for i in range(len(utts)):
+            for j in range(i + 1, len(utts)):
+                a, b = utts[i], utts[j]
+                key = (a, b) if a < b else (b, a)
+                cand.append(key)
+        random.shuffle(cand)
+        for key in cand[:pos_per_spk]:
+            if key not in pairs_set:
+                pairs_set.add(key); pairs.append(key); labels.append(1)
+    # 负样本
+    spk_list = list(speakers)
+    pbar_neg = pb_iter(speakers, desc="生成负样本", total=len(speakers)) if HAS_TQDM else speakers
+    for spk in pbar_neg:
+        utts_a = spk2utts[spk]
+        for _ in range(neg_per_spk):
+            other = spk
+            tries = 0
+            while other == spk and tries < 20:
+                other = random.choice(spk_list); tries += 1
+            utt_a = random.choice(utts_a)
+            utt_b = random.choice(spk2utts[other])
+            a, b = utt_a, utt_b
+            key = (a, b) if a < b else (b, a)
+            if key in pairs_set: continue
+            pairs_set.add(key); pairs.append(key); labels.append(0)
+    if len(pairs) > max_pairs:
+        idx = list(range(len(pairs))); random.shuffle(idx); idx = idx[:max_pairs]
+        pairs = [pairs[i] for i in idx]; labels = [labels[i] for i in idx]
+    print(f"[AUTO-TRIALS] pairs={len(pairs)}（正/负={sum(labels)}/{len(labels)-sum(labels)}），说话人={len(spk2utts)}")
+    return pairs, labels
+
+def save_trials(path: str, pairs: List[Tuple[str, str]], labels: List[int]):
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as f:
+        for (a, b), y in zip(pairs, labels):
+            f.write(f"{a}\t{b}\t{y}\n")
+    print(f"[AUTO-TRIALS] 已保存：{path}")
+
+
+# -----------------------------
+# 指标/曲线/置信区间（ROC/PR/DET 带进度条）
+# -----------------------------
+def compute_eer_mindcf(scores: np.ndarray, labels: np.ndarray,
+                       p_target: float = 0.01, c_miss: float = 1.0, c_fa: float = 1.0,
+                       progress: bool = False):
+    assert scores.shape[0] == labels.shape[0]
+    thr = np.unique(scores)
+    # —— 新增：当唯一阈值太多时做栅格下采样（例如最多 4096 个）——
+    MAX_THR = 4096
+    if thr.shape[0] > MAX_THR:
+        thr = np.linspace(thr.min() - 1e-6, thr.max() + 1e-6, MAX_THR).astype(np.float64)
+    else:
+        thr = np.concatenate(([thr.min() - 1e-6], thr, [thr.max() + 1e-6]))
+    thr = np.concatenate(([thr.min() - 1e-6], thr, [thr.max() + 1e-6]))
+    P = int(np.sum(labels == 1)); N = int(np.sum(labels == 0))
+    if P == 0 or N == 0: raise ValueError("标签全为同类，无法计算 EER/minDCF")
+    FPR_list, FNR_list = [], []
+    it = pb_iter(thr, desc="EER扫描", total=len(thr)) if (HAS_TQDM and progress) else thr
+    for t in it:
+        pred = (scores >= t)
+        TP = int(np.sum((pred == 1) & (labels == 1)))
+        FP = int(np.sum((pred == 1) & (labels == 0)))
+        FN = int(np.sum((pred == 0) & (labels == 1)))
+        FPR_list.append(FP / float(N))
+        FNR_list.append(FN / float(P))
+    FPR_arr = np.asarray(FPR_list); FNR_arr = np.asarray(FNR_list)
+    diff = FPR_arr - FNR_arr
+    idx = np.where(np.diff(np.sign(diff)) != 0)[0]
+    if len(idx) == 0:
+        k = int(np.argmin(np.abs(diff))); eer = 0.5 * (FPR_arr[k] + FNR_arr[k]); tau = float(thr[k])
+    else:
+        k = int(idx[0]); x0, x1 = float(thr[k]), float(thr[k + 1]); y0, y1 = float(diff[k]), float(diff[k + 1])
+        tau = x0 if abs(y1 - y0) < 1e-12 else x0 - y0 * (x1 - x0) / (y1 - y0)
+        eer = 0.5 * (FPR_arr[k] + FNR_arr[k])
+    dcf = c_miss * p_target * FNR_arr + c_fa * (1 - p_target) * FPR_arr
+    min_dcf = float(np.min(dcf))
+    return float(eer), float(min_dcf), tau, FPR_arr, FNR_arr, thr
+
+def roc_points(scores: np.ndarray, labels: np.ndarray, num=2048, progress: bool = False):
+    thr = np.linspace(scores.min() - 1e-6, scores.max() + 1e-6, num)
+    P = np.sum(labels == 1); N = np.sum(labels == 0)
+    TPR, FPR = [], []
+    it = pb_iter(thr, desc="ROC阈值", total=num) if (HAS_TQDM and progress) else thr
+    for t in it:
+        pred = (scores >= t)
+        TP = np.sum((pred == 1) & (labels == 1))
+        FP = np.sum((pred == 1) & (labels == 0))
+        FN = np.sum((pred == 0) & (labels == 1))
+        TPR.append(TP / float(P) if P else 0.0)
+        FPR.append(FP / float(N) if N else 0.0)
+    return np.asarray(FPR), np.asarray(TPR), thr
+
+def pr_points(scores: np.ndarray, labels: np.ndarray, num=2048, progress: bool = False):
+    thr = np.linspace(scores.min() - 1e-6, scores.max() + 1e-6, num)
+    PREC, REC = [], []
+    P = np.sum(labels == 1)
+    it = pb_iter(thr, desc="PR阈值", total=num) if (HAS_TQDM and progress) else thr
+    for t in it:
+        pred = (scores >= t)
+        TP = np.sum((pred == 1) & (labels == 1))
+        FP = np.sum((pred == 1) & (labels == 0))
+        FN = np.sum((pred == 0) & (labels == 1))
+        precision = TP / float(TP + FP) if (TP + FP) else 0.0
+        recall    = TP / float(P) if P else 0.0
+        PREC.append(precision); REC.append(recall)
+    return np.asarray(PREC), np.asarray(REC), thr
+
+def auc_trapz(x: np.ndarray, y: np.ndarray):
+    idx = np.argsort(x)
+    return float(np.trapz(y[idx], x[idx]))
+
+def find_threshold_for_far(scores: np.ndarray, labels: np.ndarray, far_target: float):
+    s_unique = np.unique(scores)
+    N = np.sum(labels == 0)
+    best_tau = s_unique.min() - 1e-6; best_far = 1.0
+    for t in s_unique:
+        pred = (scores >= t)
+        FP = np.sum((pred == 1) & (labels == 0))
+        far = FP / float(N) if N else 0.0
+        if far <= far_target:
+            if (t > best_tau) or (abs(t - best_tau) < 1e-12 and far < best_far):
+                best_tau = float(t); best_far = float(far)
+    return best_tau
+
+def metrics_at_threshold(scores: np.ndarray, labels: np.ndarray, tau: float):
+    pred = (scores >= tau)
+    P = np.sum(labels == 1); N = np.sum(labels == 0)
+    TP = int(np.sum((pred == 1) & (labels == 1)))
+    FP = int(np.sum((pred == 1) & (labels == 0)))
+    TN = int(np.sum((pred == 0) & (labels == 0)))
+    FN = int(np.sum((pred == 0) & (labels == 1)))
+    FAR = FP / float(N) if N else 0.0
+    FRR = FN / float(P) if P else 0.0
+    ACC = (TP + TN) / float(P + N) if (P + N) else 0.0
+    PREC = TP / float(TP + FP) if (TP + FP) else 0.0
+    REC = TP / float(TP + FN) if (TP + FN) else 0.0
+    F1 = 2 * PREC * REC / float(PREC + REC) if (PREC + REC) else 0.0
+    mu_pos = scores[labels == 1].mean() if P else 0.0
+    mu_neg = scores[labels == 0].mean() if N else 0.0
+    var = 0.5 * ((scores[labels == 1].var() if P else 0.0) + (scores[labels == 0].var() if N else 0.0))
+    dprime = (mu_pos - mu_neg) / math.sqrt(var + 1e-12) if var > 0 else 0.0
+    return dict(TP=TP, FP=FP, TN=TN, FN=FN, FAR=FAR, FRR=FRR, ACC=ACC, F1=F1, dprime=float(dprime))
+
+def bootstrap_ci(scores: np.ndarray, labels: np.ndarray, B=1000, seed=2024):
+    rng = np.random.default_rng(seed)
+    n = len(scores)
+    eers, aucs = [], []
+    it = pb_iter(range(B), desc="bootstrap(pairs)", total=B) if HAS_TQDM else range(B)
+    for _ in it:
+        idx = rng.integers(0, n, size=n)
+        s = scores[idx]; y = labels[idx]
+        try:
+            eer, _, _, _, _, _ = compute_eer_mindcf(s, y)
+            FPR, TPR, _ = roc_points(s, y)
+            aucs.append(auc_trapz(FPR, TPR))
+            eers.append(eer)
+        except Exception:
+            pass
+    def pct(a, p): return float(np.percentile(a, p)) if a else None
+    return dict(
+        EER_mean=float(np.mean(eers)) if eers else None,
+        EER_ci95=[pct(eers, 2.5), pct(eers, 97.5)],
+        AUC_mean=float(np.mean(aucs)) if aucs else None,
+        AUC_ci95=[pct(aucs, 2.5), pct(aucs, 97.5)]
+    )
+
+def speaker_bootstrap_ci(pairs, labels, scores, path2spk: Optional[Dict[str,str]]=None, B=1000, seed=2024):
+    def spk_of(path: str) -> str:
+        if path2spk and path in path2spk:
+            return path2spk[path]
+        return os.path.basename(os.path.dirname(path))
+    idx_by_spk: Dict[str, List[int]] = {}
+    for i,(a,b) in enumerate(pairs):
+        for s in {spk_of(a), spk_of(b)}:
+            idx_by_spk.setdefault(s, []).append(i)
+    spks = sorted(idx_by_spk.keys())
+    rng = np.random.default_rng(seed)
+    eers, aucs = [], []
+    it = pb_iter(range(B), desc="bootstrap(spk)", total=B) if HAS_TQDM else range(B)
+    for _ in it:
+        boot_idx = []
+        pick = rng.choice(spks, size=len(spks), replace=True)
+        for s in pick:
+            boot_idx += idx_by_spk[s]
+        if not boot_idx: continue
+        boot_idx = np.unique(boot_idx)
+        s = np.asarray([scores[j] for j in boot_idx])
+        y = np.asarray([labels[j] for j in boot_idx])
+        try:
+            eer,_,_,_,_,_ = compute_eer_mindcf(s,y)
+            FPR,TPR,_ = roc_points(s,y)
+            aucs.append(auc_trapz(FPR,TPR)); eers.append(eer)
+        except Exception:
+            pass
+    def pct(a,p): return float(np.percentile(a,p)) if a else None
+    return {
+        "EER_ci95_speaker": [pct(eers,2.5), pct(eers,97.5)],
+        "AUC_ci95_speaker": [pct(aucs,2.5), pct(aucs,97.5)]
+    }
+
+def plot_and_save_curves(scores: np.ndarray, labels: np.ndarray, out_dir: str, det_probit=False):
+    ensure_dir(out_dir)
+    # hist
+    if HAS_MPL:
+        try:
+            plt.figure(figsize=(6,4))
+            plt.hist(scores[labels==1], bins=50, alpha=0.6, label="pos", density=True)
+            plt.hist(scores[labels==0], bins=50, alpha=0.6, label="neg", density=True)
+            plt.xlabel("score"); plt.ylabel("density"); plt.legend(); plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, "hist.png"), dpi=200); plt.close()
+        except Exception:
+            pass
+    # ROC
+    FPR, TPR, thr = roc_points(scores, labels, progress=True)
+    auc = auc_trapz(FPR, TPR)
+    np.savetxt(os.path.join(out_dir, "roc.csv"),
+               np.vstack([FPR, TPR, thr]).T, delimiter=",",
+               header="FPR,TPR,threshold", comments="")
+    if HAS_MPL:
+        try:
+            plt.figure(figsize=(5,5)); plt.plot(FPR, TPR); plt.xlabel("FPR"); plt.ylabel("TPR")
+            plt.title(f"ROC (AUC={auc:.4f})"); plt.grid(True); plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, "roc.png"), dpi=200); plt.close()
+        except Exception:
+            pass
+    # DET
+    try:
+        eer, _, tau, FPR_arr, FNR_arr, thr_e = compute_eer_mindcf(scores, labels, progress=True)
+        np.savetxt(os.path.join(out_dir, "det.csv"),
+                   np.vstack([FPR_arr, FNR_arr, thr_e]).T, delimiter=",",
+                   header="FPR,FNR,threshold", comments="")
+        if HAS_MPL:
+            if det_probit and HAS_SCIPY:
+                eps=1e-9
+                x = norm.ppf(np.clip(FPR_arr, eps, 1-eps))
+                y = norm.ppf(np.clip(FNR_arr, eps, 1-eps))
+                plt.figure(figsize=(5,5)); plt.plot(x, y)
+                plt.xlabel("probit(FPR)"); plt.ylabel("probit(FNR)")
+                plt.title(f"DET (EER={eer:.4f}, tau={tau:.4f})")
+                plt.grid(True); plt.tight_layout(); plt.savefig(os.path.join(out_dir, "det_probit.png"), dpi=200); plt.close()
+            else:
+                plt.figure(figsize=(5,5)); plt.plot(FPR_arr, FNR_arr)
+                plt.xlabel("FPR"); plt.ylabel("FNR"); plt.title(f"DET-like (EER={eer:.4f}, tau={tau:.4f})")
+                plt.grid(True); plt.tight_layout(); plt.savefig(os.path.join(out_dir, "det.png"), dpi=200); plt.close()
+    except Exception:
+        pass
+    # PR
+    if HAS_MPL:
+        try:
+            PREC, REC, _ = pr_points(scores, labels, progress=True)
+            plt.figure(figsize=(5,5)); plt.plot(REC, PREC)
+            plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title("PR Curve")
+            plt.grid(True); plt.tight_layout(); plt.savefig(os.path.join(out_dir, "pr.png"), dpi=200); plt.close()
+        except Exception:
+            pass
+    return auc
+
+
+# -----------------------------
+# 嵌入 + 变换（PCA/量化/同盐）
+# -----------------------------
+def file_sig(path: str) -> str:
+    try:
+        st = os.stat(path)
+        return f"{int(st.st_mtime)}_{int(st.st_size)}"
+    except Exception:
+        return "nosig"
+
+def emb_cache_key(raw_model_sig: str, wav_path: str) -> str:
+    return hashlib.sha256((raw_model_sig + "||" + os.path.abspath(wav_path) + "||" + file_sig(wav_path)).encode("utf-8")).hexdigest()
+
+def get_embedding(predictor: MVectorPredictor, wav: str) -> np.ndarray:
+    feat = predictor.predict(wav)
+    vec = np.asarray(feat, dtype=np.float32).reshape(-1)
+    nrm = np.linalg.norm(vec)
+    if nrm < 1e-12:
+        raise ValueError(f"向量范数为 0：{wav}")
+    return vec / nrm
+
+def prepare_embeddings(paths: List[str],
+                       predictor: MVectorPredictor,
+                       pca_dim: Optional[int] = None,
+                       quantize: Optional[str] = None,      # None|fp16|int8
+                       salt_mode: Optional[str] = None,     # None|additive|orth|signperm（同盐整体变换用）
+                       salt: Optional[str] = None,
+                       salt_eps: float = 0.05,
+                       use_cache: bool = True,
+                       cache_dir: Optional[str] = None,
+                       raw_model_sig: Optional[str] = None) -> Dict[str, np.ndarray]:
+    emb: Dict[str, np.ndarray] = {}
+    it = pb_iter(paths, desc="嵌入提取", total=len(paths)) if HAS_TQDM else paths
+    if use_cache and cache_dir and raw_model_sig:
+        ensure_dir(cache_dir)
+    for p in it:
+        try:
+            if use_cache and cache_dir and raw_model_sig:
+                key = emb_cache_key(raw_model_sig, p)
+                npy = os.path.join(cache_dir, f"{key}.npy")
+                if os.path.isfile(npy):
+                    v = np.load(npy).astype(np.float32)
+                    emb[p] = v / (np.linalg.norm(v) + 1e-12)
+                    continue
+            v = get_embedding(predictor, p)
+            emb[p] = v
+            if use_cache and cache_dir and raw_model_sig:
+                key = emb_cache_key(raw_model_sig, p)
+                np.save(os.path.join(cache_dir, f"{key}.npy"), v.astype(np.float32))
+        except Exception as e:
+            print(f"[WARN] 嵌入失败，跳过：{p} —— {e}")
+    if not emb:
+        return emb
+    # 同盐扰动
+    if salt_mode in {"additive", "orth", "signperm"} and salt:
+        any_vec = next(iter(emb.values()))
+        d = any_vec.shape[0]
+        if salt_mode == "additive":
+            r = _additive_vec_from_salt(salt, d)
+            for k, v in emb.items():
+                v2 = v + salt_eps * r
+                emb[k] = v2 / (np.linalg.norm(v2) + 1e-12)
+        elif salt_mode == "orth":
+            Q = _orth_from_salt(salt, d)
+            for k, v in emb.items():
+                v2 = Q @ v
+                emb[k] = v2 / (np.linalg.norm(v2) + 1e-12)
+        elif salt_mode == "signperm":
+            perm, signs = _signperm_from_salt(salt, d)
+            for k, v in emb.items():
+                v2 = signs * v[perm]
+                emb[k] = v2 / (np.linalg.norm(v2) + 1e-12)
+        print(f"[BASELINE] 同盐变换：{salt_mode}")
+    # PCA
+    if pca_dim and pca_dim > 0:
+        X = np.stack(list(emb.values()), axis=0)
+        d = X.shape[1]
+        pca_dim = min(pca_dim, d)
+        try:
+            if HAS_SK:
+                pca = PCA(n_components=pca_dim, svd_solver="auto", whiten=False)
+                Z = pca.fit_transform(X)
+            else:
+                Xc = X - X.mean(axis=0, keepdims=True)
+                U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+                W = Vt[:pca_dim, :].T
+                Z = Xc @ W
+            for i, k in enumerate(emb.keys()):
+                z = Z[i].astype(np.float32)
+                z = z / (np.linalg.norm(z) + 1e-12)
+                emb[k] = z
+            print(f"[BASELINE] PCA -> {pca_dim} 维")
+        except Exception as e:
+            print(f"[WARN] PCA 失败：{e}")
+    # 量化
+    if quantize in {"fp16", "int8"}:
+        for k, v in emb.items():
+            if quantize == "fp16":
+                vq = v.astype(np.float16).astype(np.float32)
+            else:
+                vq = np.clip(np.round(v * 127.0), -127, 127).astype(np.int8).astype(np.float32) / 127.0
+            vq = vq / (np.linalg.norm(vq) + 1e-12)
+            emb[k] = vq
+        print(f"[BASELINE] 量化：{quantize}")
+    return emb
+
+
+# -----------------------------
+# 盐变换 + 固定点
+# -----------------------------
+_SALT_CACHE = {"orth": {}, "signperm": {}, "additive": {}}
+
+def _rng_from_salt(salt: str):
+    h = hashlib.sha256(salt.encode("utf-8")).digest()
+    seed = int.from_bytes(h[:8], "little", signed=False)
+    return np.random.default_rng(seed)
+
+def _orth_from_salt(salt: str, d: int) -> np.ndarray:
+    key = (salt, d)
+    if key in _SALT_CACHE["orth"]: return _SALT_CACHE["orth"][key]
+    rng = _rng_from_salt(salt)
+    A = rng.standard_normal((d, d)).astype(np.float32)
+    Q, _ = np.linalg.qr(A)
+    if np.linalg.det(Q) < 0: Q[:, 0] *= -1.0
+    _SALT_CACHE["orth"][key] = Q.astype(np.float32)
+    return _SALT_CACHE["orth"][key]
+
+def _signperm_from_salt(salt: str, d: int):
+    key = (salt, d)
+    if key in _SALT_CACHE["signperm"]: return _SALT_CACHE["signperm"][key]
+    rng = _rng_from_salt(salt)
+    perm = rng.permutation(d).astype(np.int32)
+    signs = rng.choice([-1.0, 1.0], size=d).astype(np.float32)
+    _SALT_CACHE["signperm"][key] = (perm, signs)
+    return _SALT_CACHE["signperm"][key]
+
+def _additive_vec_from_salt(salt: str, d: int) -> np.ndarray:
+    key = (salt, d)
+    if key in _SALT_CACHE["additive"]: return _SALT_CACHE["additive"][key]
+    r = sha_to_rng(salt, d)
+    r = r / (np.linalg.norm(r) + 1e-12)
+    _SALT_CACHE["additive"][key] = r.astype(np.float32)
+    return _SALT_CACHE["additive"][key]
+
+def apply_salt(vec: np.ndarray, salt: Optional[str], mode: Optional[str], eps: float) -> np.ndarray:
+    if salt is None or mode in {None, "none"}:
+        v = vec
+    elif mode == "orth":
+        Q = _orth_from_salt(salt, vec.shape[0]); v = Q @ vec
+    elif mode == "signperm":
+        perm, signs = _signperm_from_salt(salt, vec.shape[0]); v = signs * vec[perm]
+    elif mode == "additive":
+        r = _additive_vec_from_salt(salt, vec.shape[0]); v = vec + eps * r
+    else:
+        v = vec
+    v = v.astype(np.float32)
+    return v / (np.linalg.norm(v) + 1e-12)
+
+def fixed_point_dot(u: np.ndarray, v: np.ndarray, k_bits=16, alpha_pow2=10, trunc_sigma=10):
+    scale = float(1 << alpha_pow2)
+    q_u = np.clip(np.round(u * scale), -(1<<(k_bits-1)), (1<<(k_bits-1))-1).astype(np.int64)
+    q_v = np.clip(np.round(v * scale), -(1<<(k_bits-1)), (1<<(k_bits-1))-1).astype(np.int64)
+    prod = (q_u * q_v).sum(dtype=np.int64)
+    s = prod >> trunc_sigma
+    return float(s)
+
+def score_pairs_fixed_point(pairs, emb_dict, k_bits=16, alpha_pow2=10, trunc_sigma=10):
+    S = []
+    it = pb_iter(pairs, desc="fixed-point打分", total=len(pairs)) if HAS_TQDM else pairs
+    for a,b in it:
+        if a not in emb_dict or b not in emb_dict:
+            S.append(0.0); continue
+        S.append(fixed_point_dot(emb_dict[a], emb_dict[b], k_bits, alpha_pow2, trunc_sigma))
+    return np.asarray(S, dtype=np.float64)
+
+
+# -----------------------------
+# 基线/消融评分
+# -----------------------------
+def score_pairs_from_emb(pairs: List[Tuple[str,str]], emb: Dict[str,np.ndarray], mode="cosine",
+                         lda_model=None, Sigma_inv=None) -> np.ndarray:
+    S = []
+    it = pb_iter(pairs, desc=f"score({mode})", total=len(pairs)) if HAS_TQDM else pairs
+    for a, b in it:
+        if a not in emb or b not in emb:
+            S.append(0.0); continue
+        x, y = emb[a], emb[b]
+        if mode == "euclid":
+            S.append(float(-np.linalg.norm(x - y)))
+        elif mode == "lda" and lda_model is not None:
+            try:
+                x2 = lda_model.transform([x])[0]
+                y2 = lda_model.transform([y])[0]
+                x2 = x2 / (np.linalg.norm(x2) + 1e-12)
+                y2 = y2 / (np.linalg.norm(y2) + 1e-12)
+                S.append(float(np.dot(x2, y2)))
+            except Exception:
+                S.append(float(np.dot(x, y)))
+        elif mode == "plda":
+            if Sigma_inv is None:
+                S.append(float(np.dot(x, y)))
+            else:
+                S.append(float(x @ Sigma_inv @ y))
+        else:
+            S.append(float(np.dot(x, y)))
+    return np.array(S, dtype=np.float32)
+
+def fit_lda_transform(spk2utts: Dict[str, List[str]], emb: Dict[str, np.ndarray], max_utts_per_spk=5):
+    if not HAS_SK:
+        print("[BASELINE] 未安装 scikit-learn，LDA 跳过。")
+        return None
+    X, y = [], []
+    it = pb_iter(spk2utts.items(), desc="LDA收集", total=len(spk2utts)) if HAS_TQDM else spk2utts.items()
+    for i, (spk, utts) in it:
+        cnt = 0
+        for u in utts:
+            if u in emb:
+                X.append(emb[u]); y.append(i); cnt += 1
+                if cnt >= max_utts_per_spk: break
+    if len(set(y)) < 2:
+        print("[BASELINE] LDA 训练说话人不足，跳过。"); return None
+    lda = LDA(solver="svd")
+    try:
+        lda.fit(np.array(X), np.array(y))
+        print(f"[BASELINE] LDA 训练完成（类数={len(set(y))}）。")
+        return lda
+    except Exception as e:
+        print(f"[BASELINE] LDA 训练失败：{e}")
+        return None
+
+def estimate_global_precision(emb: Dict[str, np.ndarray]) -> Optional[np.ndarray]:
+    try:
+        X = np.stack(list(emb.values()), axis=0)
+        C = np.cov(X.T) + 1e-4 * np.eye(X.shape[1], dtype=np.float32)
+        Sigma_inv = np.linalg.inv(C)
+        return Sigma_inv.astype(np.float32)
+    except Exception as e:
+        print(f"[BASELINE] 估计全局精度矩阵失败：{e}")
+        return None
+
+
+# -----------------------------
+# 评测封装
+# -----------------------------
+def eval_scores_and_metrics(scores: np.ndarray, pairs: List[Tuple[str,str]],
+                            labels: Optional[List[int]],
+                            save_scores: Optional[str],
+                            report_dir: Optional[str],
+                            tag: Optional[str] = None,
+                            det_probit: bool = False,
+                            path2spk: Optional[Dict[str,str]] = None) -> dict:
+    ensure_dir(report_dir or "output/report")
+    kept = len(scores)
+    print(f"[EVAL] pairs={kept}，score均值={scores.mean():.6f}，std={scores.std():.6f}")
+
+    if save_scores is not None:
+        try:
+            ensure_dir(os.path.dirname(save_scores))
+            with open(save_scores, "w", encoding="utf-8") as fw:
+                fw.write("# score\tlabel(可空)\tpath1\tpath2\n")
+                for i, (a, b) in enumerate(pairs[:kept]):
+                    lbl = "" if (labels is None or i >= len(labels)) else str(labels[i])
+                    fw.write(f"{scores[i]:.6f}\t{lbl}\t{a}\t{b}\n")
+            print(f"[SAVE] 分数：{save_scores}")
+        except Exception as e:
+            print(f"[WARN] 保存分数失败：{e}")
+
+    results = {
+        "kept": kept, "scores_mean": float(scores.mean()), "scores_std": float(scores.std()),
+        "eer": None, "min_dcf": None, "tau_eer": None,
+        "auc": None, "metrics_at_eer": None, "metrics_at_far1": None, "metrics_at_far0_1": None,
+        "bootstrap_pair": None, "bootstrap_speaker": None
+    }
+
+    if labels is not None and len(labels) == kept and kept > 0:
+        labels_np = np.array(labels, dtype=np.int32)
+        eer, mindcf, tau_eer, _, _, _ = compute_eer_mindcf(scores, labels_np, progress=True)
+        results["eer"] = float(eer); results["min_dcf"] = float(mindcf); results["tau_eer"] = float(tau_eer)
+        print(f"[METRICS] tau(EER)={tau_eer:.4f}，EER={eer:.5f}，minDCF={mindcf:.5f}")
+
+        auc = plot_and_save_curves(scores, labels_np, report_dir or "output/report", det_probit=det_probit)
+        results["auc"] = float(auc) if auc is not None else None
+        if auc is not None: print(f"[METRICS] AUC={auc:.5f}")
+
+        results["metrics_at_eer"] = metrics_at_threshold(scores, labels_np, tau_eer)
+        tau_far1 = find_threshold_for_far(scores, labels_np, 0.01)
+        results["metrics_at_far1"] = metrics_at_threshold(scores, labels_np, tau_far1)
+        tau_far0_1 = find_threshold_for_far(scores, labels_np, 0.001)
+        results["metrics_at_far0_1"] = metrics_at_threshold(scores, labels_np, tau_far0_1)
+
+        print(f"[POINTS] @EER   tau={tau_eer:.4f}  -> FAR={results['metrics_at_eer']['FAR']:.4f}, "
+              f"FRR={results['metrics_at_eer']['FRR']:.4f}, ACC={results['metrics_at_eer']['ACC']:.4f}")
+        print(f"[POINTS] @FAR1% tau={tau_far1:.4f} -> FAR={results['metrics_at_far1']['FAR']:.4f}, "
+              f"FRR={results['metrics_at_far1']['FRR']:.4f}, ACC={results['metrics_at_far1']['ACC']:.4f}")
+        print(f"[POINTS] @FAR0.1% tau={tau_far0_1:.4f} -> FAR={results['metrics_at_far0_1']['FAR']:.4f}, "
+              f"FRR={results['metrics_at_far0_1']['FRR']:.4f}, ACC={results['metrics_at_far0_1']['ACC']:.4f}")
+
+        boot_pair = bootstrap_ci(scores, labels_np, B=50, seed=2024)
+        results["bootstrap_pair"] = boot_pair
+        boot_spk = speaker_bootstrap_ci(pairs, labels_np, scores, path2spk=path2spk, B=50, seed=2024)
+        results["bootstrap_speaker"] = boot_spk
+
+        if boot_pair["EER_ci95"][0] is not None:
+            print(f"[BOOT(pairs)]   EER mean={boot_pair['EER_mean']:.4f}, 95% CI=({boot_pair['EER_ci95'][0]:.4f}, {boot_pair['EER_ci95'][1]:.4f})")
+            print(f"[BOOT(pairs)]   AUC mean={boot_pair['AUC_mean']:.4f}, 95% CI=({boot_pair['AUC_ci95'][0]:.4f}, {boot_pair['AUC_ci95'][1]:.4f})")
+        if boot_spk["EER_ci95_speaker"][0] is not None:
+            print(f"[BOOT(speaker)] EER 95% CI=({boot_spk['EER_ci95_speaker'][0]:.4f}, {boot_spk['EER_ci95_speaker'][1]:.4f})")
+            print(f"[BOOT(speaker)] AUC 95% CI=({boot_spk['AUC_ci95_speaker'][0]:.4f}, {boot_spk['AUC_ci95_speaker'][1]:.4f})")
+
+        save_metrics_json(report_dir or "output/report", results, tag)
+    else:
+        print("[INFO] 无完整标签：仅输出分数统计，不计算 EER/minDCF/曲线。")
+    return results
+
+
+# -----------------------------
+# 快速评测（明文余弦）
+# -----------------------------
+def eval_trials_plaintext_fast(predictor: MVectorPredictor,
+                               pairs: List[Tuple[str, str]],
+                               labels: Optional[List[int]],
+                               save_scores: Optional[str] = None,
+                               report_dir: Optional[str] = None,
+                               tag: Optional[str] = None,
+                               det_probit: bool = False,
+                               path2spk: Optional[Dict[str,str]] = None,
+                               use_cache: bool = True,
+                               cache_dir: Optional[str] = None,
+                               raw_model_sig: Optional[str] = None) -> dict:
+    uniq_paths = sorted(list({p for ab in pairs for p in ab}))
+    with StageTimer("嵌入提取(test)"):
+        emb = prepare_embeddings(uniq_paths, predictor,
+                                 use_cache=use_cache, cache_dir=cache_dir, raw_model_sig=raw_model_sig)
+    S = []
+    it = pb_iter(pairs, desc="score(cosine)", total=len(pairs)) if HAS_TQDM else pairs
+    for a,b in it:
+        if a not in emb or b not in emb:
+            S.append(0.0); continue
+        S.append(float(np.dot(emb[a], emb[b])))
+    scores_np = np.array(S, dtype=np.float32)
+    with StageTimer("评测与作图(test)"):
+        return eval_scores_and_metrics(scores_np, pairs, labels, save_scores, report_dir, tag, det_probit, path2spk)
+
+
+# -----------------------------
+# 基线/消融
+# -----------------------------
+def run_baselines(predictor: MVectorPredictor,
+                  pairs: List[Tuple[str,str]],
+                  labels: Optional[List[int]],
+                  spk2utts_test: Dict[str,List[str]],
+                  report_dir: str,
+                  modes: List[str],
+                  pca_dim: Optional[int],
+                  quantize: Optional[str],
+                  salt_mode: Optional[str],
+                  salt: Optional[str],
+                  salt_eps: float,
+                  emb_backend: Optional[Dict[str,np.ndarray]] = None,
+                  spk2utts_dev: Optional[Dict[str,List[str]]]=None,
+                  path2spk_test: Optional[Dict[str,str]] = None,
+                  det_probit: bool = False,
+                  use_cache: bool = True,
+                  cache_dir: Optional[str] = None,
+                  raw_model_sig: Optional[str] = None):
+    ensure_dir(report_dir)
+    uniq_paths = sorted(list({p for ab in pairs for p in ab}))
+    with StageTimer("嵌入/变换(基线)"):
+        emb_test = prepare_embeddings(uniq_paths, predictor, pca_dim=pca_dim,
+                                      quantize=quantize, salt_mode=salt_mode, salt=salt, salt_eps=salt_eps,
+                                      use_cache=use_cache, cache_dir=cache_dir, raw_model_sig=raw_model_sig)
+    if not emb_test:
+        print("[BASELINE] 嵌为空，跳过。"); return
+    lda_model, Sigma_inv = None, None
+    if "lda" in modes and emb_backend and spk2utts_dev:
+        lda_model = fit_lda_transform(spk2utts_dev, emb_backend)
+    if "plda" in modes and emb_backend:
+        Sigma_inv = estimate_global_precision(emb_backend)
+    all_curves = {}
+    for m in modes:
+        if m == "lda" and lda_model is None:
+            print("[BASELINE] LDA 跳过。"); continue
+        if m == "plda" and Sigma_inv is None:
+            print("[BASELINE] PLDA-like 跳过。"); continue
+        S = score_pairs_from_emb(pairs, emb_test, mode=m, lda_model=lda_model, Sigma_inv=Sigma_inv)
+        tag = f"_{m}"
+        res = eval_scores_and_metrics(S, pairs, labels,
+                                      save_scores=os.path.join(report_dir, f"scores{tag}.txt"),
+                                      report_dir=report_dir, tag=tag, det_probit=det_probit, path2spk=path2spk_test)
+        all_curves[m] = res
+    # 画 ROC 对比
+    if labels is not None and HAS_MPL and all_curves:
+        try:
+            plt.figure(figsize=(6,6))
+            for m in all_curves.keys():
+                arr = np.loadtxt(os.path.join(report_dir, f"scores_{m}.txt"),
+                                 dtype=str, comments="#")
+                if arr.ndim == 1 and arr.size > 0: arr = arr[None, :]
+                svals = arr[:,0].astype(np.float32)
+                lbls = arr[:,1].astype(np.int32)
+                FPR, TPR, _ = roc_points(svals, lbls)
+                auc = auc_trapz(FPR, TPR)
+                plt.plot(FPR, TPR, label=f"{m} (AUC={auc:.4f})")
+            plt.xlabel("FPR"); plt.ylabel("TPR"); plt.title("ROC (Baselines)")
+            plt.legend(); plt.grid(True); plt.tight_layout()
+            plt.savefig(os.path.join(report_dir, "roc_baselines.png"), dpi=200); plt.close()
+        except Exception:
+            pass
+        try:
+            plt.figure(figsize=(6,6))
+            for m in all_curves.keys():
+                arr = np.loadtxt(os.path.join(report_dir, f"scores_{m}.txt"),
+                                 dtype=str, comments="#")
+                if arr.ndim == 1 and arr.size > 0: arr = arr[None, :]
+                svals = arr[:,0].astype(np.float32)
+                lbls = arr[:,1].astype(np.int32)
+                PREC, REC, _ = pr_points(svals, lbls)
+                plt.plot(REC, PREC, label=m)
+            plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title("PR (Baselines)")
+            plt.legend(); plt.grid(True); plt.tight_layout()
+            plt.savefig(os.path.join(report_dir, "pr_baselines.png"), dpi=200); plt.close()
+        except Exception:
+            pass
+
+
+# -----------------------------
+# 错盐不可链接评估
+# -----------------------------
+def score_pairs_with_salts(pairs: List[Tuple[str, str]], emb: Dict[str, np.ndarray],
+                           salt_left: Optional[str], salt_right: Optional[str],
+                           salt_mode: Optional[str], salt_eps: float,
+                           backend: str = "cosine") -> np.ndarray:
+    S = []
+    it = pb_iter(pairs, desc=f"salt[{salt_left}|{salt_right}]", total=len(pairs)) if HAS_TQDM else pairs
+    for a, b in it:
+        if a not in emb or b not in emb:
+            S.append(0.0); continue
+        x = apply_salt(emb[a], salt_left, salt_mode, salt_eps)
+        y = apply_salt(emb[b], salt_right, salt_mode, salt_eps)
+        s = -np.linalg.norm(x - y) if backend == "euclid" else float(np.dot(x, y))
+        S.append(s)
+    return np.asarray(S, dtype=np.float32)
+
+def eval_cross_salt_unlinkability(pairs: List[Tuple[str, str]], labels: List[int],
+                                  predictor: MVectorPredictor,
+                                  report_dir: str,
+                                  pca_dim: Optional[int],
+                                  quantize: Optional[str],
+                                  salt_mode: str,
+                                  salt1: str, salt2: str,
+                                  salt_eps: float,
+                                  use_cache: bool,
+                                  cache_dir: Optional[str],
+                                  raw_model_sig: Optional[str]):
+    ensure_dir(os.path.join(report_dir, "salt_compare"))
+    uniq_paths = sorted(list({p for ab in pairs for p in ab}))
+    with StageTimer("嵌入(错盐baseline)"):
+        emb_base = prepare_embeddings(uniq_paths, predictor,
+                                      pca_dim=pca_dim, quantize=quantize,
+                                      salt_mode=None, salt=None, salt_eps=0.0,
+                                      use_cache=use_cache, cache_dir=cache_dir, raw_model_sig=raw_model_sig)
+    if not emb_base:
+        print("[CROSS-SALT] 嵌入为空，中止。"); return
+
+    y = np.asarray(labels, dtype=np.int32)
+    pos = (y == 1); neg = (y == 0)
+
+    S_same = score_pairs_with_salts(pairs, emb_base, salt1, salt1, salt_mode, salt_eps, backend="cosine")
+    S_cross = score_pairs_with_salts(pairs, emb_base, salt1, salt2, salt_mode, salt_eps, backend="cosine")
+
+    cross_genuine = S_cross[pos]
+    same_impostor = S_same[neg]
+
+    def ks_distance_1d(a: np.ndarray, b: np.ndarray) -> float:
+        a = np.sort(a); b = np.sort(b)
+        xs = np.sort(np.concatenate([a, b]))
+        cdfa = np.searchsorted(a, xs, side="right") / float(len(a))
+        cdfb = np.searchsorted(b, xs, side="right") / float(len(b))
+        return float(np.max(np.abs(cdfa - cdfb)))
+
+    def wasserstein_approx_1d(a: np.ndarray, b: np.ndarray, k: int = None) -> float:
+        a = np.sort(a); b = np.sort(b)
+        n, m = len(a), len(b)
+        k = k or max(n, m)
+        q = (np.arange(k) + 0.5) / k
+        qa = np.interp(q, (np.arange(n) + 0.5) / n, a)
+        qb = np.interp(q, (np.arange(m) + 0.5) / m, b)
+        return float(np.mean(np.abs(qa - qb)))
+
+    ks = ks_distance_1d(cross_genuine, same_impostor)
+    w1 = wasserstein_approx_1d(cross_genuine, same_impostor)
+
+    X = np.concatenate([cross_genuine, same_impostor])
+    Y = np.concatenate([np.ones_like(cross_genuine, dtype=np.int32),
+                        np.zeros_like(same_impostor, dtype=np.int32)])
+    FPR, TPR, _ = roc_points(X, Y)
+    auc_ci = auc_trapz(FPR, TPR)
+    eer_ci, _, _, _, _, _ = compute_eer_mindcf(X, Y)
+
+    sg = S_same[pos]; cg = S_cross[pos]
+    corr = float(np.corrcoef(sg, cg)[0, 1]) if (len(sg) > 2 and len(cg) > 2) else float("nan")
+
+    if HAS_MPL:
+        try:
+            plt.figure(figsize=(8,5))
+            plt.hist(cross_genuine, bins=60, density=True, alpha=0.6, label="cross-salt (genuine)")
+            plt.hist(same_impostor, bins=60, density=True, alpha=0.6, label="same-salt (impostor)")
+            plt.xlabel("score"); plt.ylabel("density"); plt.legend(); plt.tight_layout()
+            plt.savefig(os.path.join(report_dir, "salt_compare", "cross_hist.png"), dpi=200); plt.close()
+        except Exception:
+            pass
+        try:
+            plt.figure(figsize=(5,5))
+            plt.plot(FPR, TPR)
+            plt.xlabel("FPR"); plt.ylabel("TPR")
+            plt.title(f"Cross vs Impostor ROC (AUC={auc_ci:.3f})")
+            plt.grid(True); plt.tight_layout()
+            plt.savefig(os.path.join(report_dir, "salt_compare", "cross_roc.png"), dpi=200); plt.close()
+        except Exception:
+            pass
+        try:
+            plt.figure(figsize=(6,6))
+            plt.scatter(sg, cg, s=10, alpha=0.6)
+            plt.xlabel("same-salt score (genuine)")
+            plt.ylabel("cross-salt score (genuine)")
+            plt.title(f"Decorrelation (r={corr:.3f})")
+            plt.grid(True); plt.tight_layout()
+            plt.savefig(os.path.join(report_dir, "salt_compare", "cross_scatter.png"), dpi=200); plt.close()
+        except Exception:
+            pass
+
+    out = {
+        "salt_mode": salt_mode, "salt_left": salt1, "salt_right": salt2,
+        "ks(cross_genuine vs same_impostor)": ks,
+        "wasserstein_approx": w1,
+        "AUC(cross_genuine vs same_impostor)": auc_ci,
+        "EER(cross_genuine vs same_impostor)": float(eer_ci),
+        "corr(same_genuine, cross_genuine)": corr,
+        "n_pos": int(np.sum(pos)), "n_neg": int(np.sum(neg))
+    }
+    save_metrics_json(os.path.join(report_dir, "salt_compare"), out, tag="_cross_salt")
+    print(f"[CROSS-SALT] KS={ks:.4f}, W≈{w1:.4f}, AUC={auc_ci:.4f}, EER={eer_ci:.4f}, corr={corr:.4f}")
+
+
+# -----------------------------
+# 噪声/截断鲁棒性
+# -----------------------------
+def random_crop(y: np.ndarray, max_len: int) -> np.ndarray:
+    if len(y) <= max_len: return y
+    start = np.random.randint(0, len(y)-max_len+1)
+    return y[start:start+max_len]
+
+def augment_and_write(path: str, snr_db: Optional[float], max_len_s: Optional[float], crop_mode: str="random") -> Tuple[Optional[str], Optional[str]]:
+    if not HAS_AUDIO:
+        return None, "未安装 soundfile/librosa，鲁棒性跳过。"
+    try:
+        y, sr = librosa.load(path, sr=16000, mono=True)
+        if max_len_s is not None and max_len_s > 0:
+            max_samples = int(sr * max_len_s)
+            if len(y) > max_samples:
+                if crop_mode == "center":
+                    off = (len(y)-max_samples)//2
+                    y = y[off:off+max_samples]
+                else:
+                    y = random_crop(y, max_samples)
+        if snr_db is not None:
+            noise = np.random.standard_normal(len(y)).astype(np.float32)
+            sig_p = np.mean(y**2) + 1e-12
+            noise_p = np.mean(noise**2) + 1e-12
+            k = math.sqrt(sig_p / (noise_p * (10**(snr_db/10.0))))
+            y = y + noise * k
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        sf.write(tmp.name, y, sr)
+        return tmp.name, None
+    except Exception as e:
+        return None, str(e)
+
+def eval_robust(predictor: MVectorPredictor,
+                pairs: List[Tuple[str,str]], labels: List[int],
+                report_dir: str,
+                snr_list: List[float], len_list: List[float],
+                crop_mode: str="random",
+                path2spk: Optional[Dict[str,str]] = None,
+                det_probit: bool = False,
+                use_cache: bool = True,
+                cache_dir: Optional[str] = None,
+                raw_model_sig: Optional[str] = None):
+    if not HAS_AUDIO:
+        print("[ROBUST] 未装音频依赖，鲁棒性跳过。")
+        return
+    for snr in snr_list or []:
+        new_pairs, tmp_files = [], []
+        for a, b in pb_iter(pairs, desc=f"噪声@{snr}dB", total=len(pairs)) if HAS_TQDM else pairs:
+            ta, _ = augment_and_write(a, snr, None, crop_mode)
+            tb, _ = augment_and_write(b, snr, None, crop_mode)
+            if ta and tb:
+                new_pairs.append((ta, tb)); tmp_files += [ta, tb]
+        _ = eval_trials_plaintext_fast(predictor, new_pairs, labels,
+                                       save_scores=os.path.join(report_dir, f"scores_snr{snr}.txt"),
+                                       report_dir=report_dir, tag=f"_snr{snr}", det_probit=det_probit,
+                                       path2spk=path2spk, use_cache=use_cache, cache_dir=cache_dir, raw_model_sig=raw_model_sig)
+        for t in set(tmp_files):
+            try: os.remove(t)
+            except Exception: pass
+    for L in len_list or []:
+        new_pairs, tmp_files = [], []
+        for a, b in pb_iter(pairs, desc=f"截断@{L}s", total=len(pairs)) if HAS_TQDM else pairs:
+            ta, _ = augment_and_write(a, None, L, crop_mode)
+            tb, _ = augment_and_write(b, None, L, crop_mode)
+            if ta and tb:
+                new_pairs.append((ta, tb)); tmp_files += [ta, tb]
+        _ = eval_trials_plaintext_fast(predictor, new_pairs, labels,
+                                       save_scores=os.path.join(report_dir, f"scores_len{L}.txt"),
+                                       report_dir=report_dir, tag=f"_len{L}", det_probit=det_probit,
+                                       path2spk=path2spk, use_cache=use_cache, cache_dir=cache_dir, raw_model_sig=raw_model_sig)
+        for t in set(tmp_files):
+            try: os.remove(t)
+            except Exception: pass
+
+
+# -----------------------------
+# 规模扩展
+# -----------------------------
+def eval_scale_speakers(predictor: MVectorPredictor, spk2utts: Dict[str,List[str]],
+                        report_dir: str, sizes: List[int], seed=123,
+                        path2spk: Optional[Dict[str,str]] = None, det_probit: bool = False,
+                        use_cache: bool = True, cache_dir: Optional[str] = None, raw_model_sig: Optional[str] = None):
+    if not sizes: return
+    random.seed(seed)
+    eers = []
+    for n in sizes:
+        spks = list(spk2utts.keys())
+        if len(spks) < n:
+            print(f"[SCALE] 说话人不足 {n}，跳过。"); continue
+        sel = random.sample(spks, n)
+        sub = {s: spk2utts[s] for s in sel}
+        pairs, labels = auto_generate_trials(sub, pos_per_spk=3, neg_per_spk=3, max_pairs=10000, seed=seed)
+        res = eval_trials_plaintext_fast(predictor, pairs, labels, report_dir=report_dir, tag=f"_scale{n}",
+                                         det_probit=det_probit, path2spk=path2spk,
+                                         use_cache=use_cache, cache_dir=cache_dir, raw_model_sig=raw_model_sig)
+        eers.append((n, res.get("eer", None)))
+    if HAS_MPL and eers:
+        xs = [x for x,_ in eers]; ys = [y if y is not None else np.nan for _,y in eers]
+        plt.figure(figsize=(6,4)); plt.plot(xs, ys, marker="o")
+        plt.xlabel("#Speakers"); plt.ylabel("EER"); plt.grid(True); plt.tight_layout()
+        plt.savefig(os.path.join(report_dir, "scale_speakers_eer.png"), dpi=200); plt.close()
+
+
+# -----------------------------
+# MPC 演示与压测（仅匹配）
+# -----------------------------
+def mpc_compare_local(predictor: MVectorPredictor, wav1: str, wav2: str, tau: float):
+    x = get_embedding(predictor, wav1)
+    y = get_embedding(predictor, wav2)
+    score = float(np.dot(x, y))
+    return score, (score >= tau)
+
+def mpc_compare_crypten(predictor: MVectorPredictor, wav1: str, wav2: str, tau: float):
+    try:
+        import torch  # noqa
+        import crypten
+        crypten.init()
+    except Exception as e:
+        raise RuntimeError(f"使用 --backend=crypten 需要安装 crypten/torch：{e}")
+    x = get_embedding(predictor, wav1)
+    y = get_embedding(predictor, wav2)
+    import torch
+    tx = torch.from_numpy(x).float(); ty = torch.from_numpy(y).float()
+    tt = torch.tensor([tau], dtype=torch.float32)
+    import crypten
+    cx = crypten.cryptensor(tx); cy = crypten.cryptensor(ty); ct = crypten.cryptensor(tt)
+    cscore = (cx * cy).sum(); c_ge = cscore.ge(ct)
+    score = float(cscore.get_plain_text().item())
+    same = bool(c_ge.get_plain_text().item() > 0.5)
+    return score, same
+
+def profile_mpc_matching_only(emb_pairs: List[Tuple[np.ndarray,np.ndarray]], tau: float, backend: str, iters: int):
+    times = []
+    K = min(iters, len(emb_pairs))
+    if backend == "local":
+        for i in pb_iter(range(K), desc="mpc-local", total=K) if HAS_TQDM else range(K):
+            x,y = emb_pairs[i]
+            t0 = time.time()
+            s = float(np.dot(x,y)); _ = (s >= tau)
+            times.append(time.time() - t0)
+    else:
+        try:
+            import torch, crypten
+            crypten.init()
+        except Exception as e:
+            raise RuntimeError(f"[MPC] 需要 crypten/torch：{e}")
+        import torch
+        for i in pb_iter(range(K), desc="mpc-crypten", total=K) if HAS_TQDM else range(K):
+            x,y = emb_pairs[i]
+            t0 = time.time()
+            cx = crypten.cryptensor(torch.from_numpy(x).float())
+            cy = crypten.cryptensor(torch.from_numpy(y).float())
+            ct = crypten.cryptensor(torch.tensor([tau], dtype=torch.float32))
+            _ = ((cx*cy).sum().ge(ct)).get_plain_text()
+            times.append(time.time()-t0)
+    t = np.array(times, dtype=np.float64)
+    print(f"[MPC-PROFILE] backend={backend} iters={K} avg={t.mean()*1000:.2f}ms "
+          f"p50={np.percentile(t,50)*1000:.2f}ms p90={np.percentile(t,90)*1000:.2f}ms "
+          f"p99={np.percentile(t,99)*1000:.2f}ms throughput={K/np.sum(t):.2f} pair/s")
+    return t
+
+def plot_latency_cdf(times: np.ndarray, out_png: str):
+    if not HAS_MPL: return
+    xs = np.sort(times*1000.0)
+    ys = np.linspace(0,1,len(xs))
+    plt.figure(figsize=(6,4))
+    plt.plot(xs, ys)
+    plt.xlabel("Latency (ms)"); plt.ylabel("CDF"); plt.grid(True); plt.tight_layout()
+    plt.savefig(out_png, dpi=200); plt.close()
+
+def plot_comm_bar(dim: int, out_png: str, k_bits: int = 16):
+    if not HAS_MPL: return
+    labels = ["float32 (1 vec)", "fp16", "int8", f"2PC shares (k={k_bits})"]
+    sizes = [4*dim, 2*dim, 1*dim, 2 * (k_bits/8.0) * dim]  # bytes per vector（粗略）
+    plt.figure(figsize=(6,4))
+    plt.bar(labels, np.array(sizes)/1024.0)
+    plt.ylabel("KB per vector"); plt.title(f"Communication (d={dim})")
+    plt.tight_layout(); plt.savefig(out_png, dpi=200); plt.close()
+
+
+# -----------------------------
+# PAD（可选）：若存在 PADPredictor 或提供 pad_trials
+# -----------------------------
+def eval_pad(predictor_pad, pad_trials: str, index_all: Dict[str,str], report_dir: str, tag: str="_pad"):
+    if not pad_trials or not os.path.isfile(pad_trials):
+        print("[PAD] 未提供 --pad_trials，跳过。"); return
+    wavs, y = [], []
+    total = sum(1 for _ in open(pad_trials, "r", encoding="utf-8", errors="ignore"))
+    it = pb_iter(open(pad_trials, "r", encoding="utf-8", errors="ignore"), desc="PAD载入", total=total) if HAS_TQDM \
+         else open(pad_trials, "r", encoding="utf-8", errors="ignore")
+    for raw in it:
+        line = raw.strip()
+        if not line or line.startswith("#"): continue
+        toks = [t for t in line.replace("\t", " ").split() if t]
+        if len(toks) < 2: continue
+        tokp, tokl = toks[0], toks[-1]
+        lbl = parse_label(tokl)
+        if lbl is None: continue
+        p = tokp
+        if not os.path.isfile(p):
+            p = index_all.get(tokp) or index_all.get(os.path.splitext(tokp)[0]) or tokp
+        if not os.path.isfile(p): continue
+        wavs.append(p); y.append(lbl)
+    if HAS_TQDM: it.close()
+    if not wavs:
+        print("[PAD] trials 为空。"); return
+    print(f"[PAD] 样本={len(wavs)}（1=bonafide, 0=spoof）。")
+    S = []
+    it2 = pb_iter(wavs, desc="PAD推理", total=len(wavs)) if HAS_TQDM else wavs
+    for p in it2:
+        try:
+            s = float(predictor_pad.predict(p))  # 数值越大越“真人”
+        except Exception as e:
+            print(f"[PAD] 失败 {p}: {e}")
+            s = 0.0
+        S.append(s)
+    scores = np.asarray(S, dtype=np.float32); labels_np = np.asarray(y, dtype=np.int32)
+    res = eval_scores_and_metrics(scores, [(w,w) for w in wavs], labels_np,
+                                  save_scores=os.path.join(report_dir, f"scores{tag}.txt"),
+                                  report_dir=report_dir, tag=tag, det_probit=False, path2spk=None)
+    return res
+
+
+# -----------------------------
+# 运行元数据
+# -----------------------------
+def collect_env_metadata(args, report_dir: str, extras: dict):
+    meta = {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "numpy": np.__version__,
+        "matplotlib": matplotlib.__version__ if HAS_MPL else None,
+        "scikit_learn": None,
+        "scipy": None,
+        "crypten": None,
+        "torch": None,
+        "cmdline": " ".join(sys.argv),
+        "args": vars(args),
+    }
+    try:
+        import sklearn
+        meta["scikit_learn"] = sklearn.__version__
+    except Exception:
+        pass
+    try:
+        import scipy
+        meta["scipy"] = scipy.__version__
+    except Exception:
+        pass
+    try:
+        import crypten, torch
+        meta["crypten"] = crypten.__version__ if hasattr(crypten, "__version__") else "installed"
+        meta["torch"] = torch.__version__
+    except Exception:
+        pass
+    meta.update(extras or {})
+    save_json(os.path.join(report_dir, "run_metadata.json"), meta)
+
+
+# -----------------------------
+# 主程序
+# -----------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    # 模型
+    ap.add_argument("--configs", type=str, default="configs/cam++.yml")
+    ap.add_argument("--model_path", type=str, default="models/CAMPPlus_Fbank/best_model/")
+    ap.add_argument("--use_gpu", type=lambda x: str(x).lower() in {"true", "1", "yes"}, default=True)
+
+    # 缓存/报告
+    ap.add_argument("--use_cache", type=lambda x: str(x).lower() in {"true", "1", "yes"}, default=True)
+    ap.add_argument("--cache_dir", type=str, default="output/cache_emb")
+    ap.add_argument("--det_probit", action="store_true")
+    ap.add_argument("--report_dir",  type=str, default="output/report")
+    ap.add_argument("--save_scores", type=str, default=None)
+
+    # 数据入口（test）
+    ap.add_argument("--validated_tsv", type=str, default=None)
+    ap.add_argument("--audio_root",   type=str, default=None)
+    ap.add_argument("--search_dirs",  type=str, nargs="*", default=None)
+    ap.add_argument("--trials",       type=str, default=None)
+
+    # 数据入口（dev：仅用于后端训练/阈值标定）
+    ap.add_argument("--dev_trials", type=str, default=None)
+    ap.add_argument("--dev_search_dirs", nargs="*", default=None)
+    ap.add_argument("--dev_validated_tsv", type=str, default=None)
+
+    # 自动 trials
+    ap.add_argument("--auto_trials", action="store_true")
+    ap.add_argument("--pos_per_spk", type=int, default=5)
+    ap.add_argument("--neg_per_spk", type=int, default=5)
+    ap.add_argument("--max_pairs",   type=int, default=20000)
+    ap.add_argument("--seed",        type=int, default=42)
+    ap.add_argument("--auto_trials_out", type=str, default="output/auto_trials.txt")
+
+    # 单次匹配
+    ap.add_argument("--audio1", type=str, default=None)
+    ap.add_argument("--audio2", type=str, default=None)
+    ap.add_argument("--threshold", type=float, default=0.60)
+    ap.add_argument("--auto_tau",  action="store_true")
+    ap.add_argument("--backend",   type=str, default="local", choices=["local", "crypten"])
+
+    # 基线/消融
+    ap.add_argument("--baselines", nargs="*", default=[], help="cosine euclid lda plda")
+    ap.add_argument("--pca_dim", type=int, default=0)
+    ap.add_argument("--quantize", type=str, default=None, choices=[None, "fp16", "int8"])
+    ap.add_argument("--salt_mode", type=str, default=None, choices=[None, "additive", "orth", "signperm"])
+    ap.add_argument("--salt", type=str, default=None, help="primary salt (same-salt)")
+    ap.add_argument("--salt2", type=str, default=None, help="second salt for cross-salt eval")
+    ap.add_argument("--salt_eps", type=float, default=0.05)
+    ap.add_argument("--cross_salt_eval", action="store_true")
+
+    # 固定点参数
+    ap.add_argument("--fp_kbits", type=int, default=16)
+    ap.add_argument("--fp_alpha_pow2", type=int, default=10)
+    ap.add_argument("--fp_trunc_sigma", type=int, default=10)
+
+    # 鲁棒性
+    ap.add_argument("--robust_noise", nargs="*", type=float, default=None)
+    ap.add_argument("--robust_len",   nargs="*", type=float, default=None)
+    ap.add_argument("--crop_mode",    type=str, default="random", choices=["random","center"])
+
+    # 规模扩展与计时
+    ap.add_argument("--scale_speakers", nargs="*", type=int, default=None)
+    ap.add_argument("--profile_embed", type=int, default=0)
+
+    # MPC 压测 + 图
+    ap.add_argument("--profile_mpc", type=int, default=0, help="仅匹配计时次数（不含嵌入提取）")
+    ap.add_argument("--cdf_latency", action="store_true")
+    ap.add_argument("--comm_plot",   action="store_true")
+
+    # PAD（可选）
+    ap.add_argument("--enable_pad", action="store_true")
+    ap.add_argument("--pad_trials", type=str, default=None)
+
+    args = ap.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    with StageTimer("加载模型"):
+        predictor = MVectorPredictor(configs=args.configs, model_path=args.model_path, use_gpu=args.use_gpu)
+        print("[MODEL] 成功加载嵌入模型。")
+    model_pth = os.path.join(args.model_path, "model.pth") if os.path.isdir(args.model_path) else args.model_path
+    raw_model_sig = safe_hash_file(model_pth) or "model_sig"
+
+    # 索引 test
+    with StageTimer("索引(test)"):
+        idx_dirs: Dict[str, str] = {}
+        if args.search_dirs:
+            idx_dirs = build_audio_index_from_dirs(args.search_dirs)
+        spk2utts_test: Dict[str, List[str]] = {}
+        path2spk_test: Dict[str, str] = {}
+        idx_tsv: Dict[str, str] = {}
+        if args.validated_tsv:
+            idx_tsv, spk2utts_test, path2spk_test = build_audio_index_from_validated(
+                args.validated_tsv, args.audio_root, args.search_dirs)
+        if not spk2utts_test and idx_dirs:
+            tmp = {}
+            for k, v in pb_iter(idx_dirs.items(), desc="聚合说话人", total=len(idx_dirs)) if HAS_TQDM else idx_dirs.items():
+                p = v
+                if not p.lower().endswith(AUDIO_EXTS): continue
+                spk = os.path.basename(os.path.dirname(os.path.dirname(p))) if "/id" in p.replace("\\","/") \
+                      else os.path.basename(os.path.dirname(p))
+                tmp.setdefault(spk, []).append(p)
+            spk2utts_test = tmp
+            path2spk_test = {p: s for s, us in tmp.items() for p in us}
+        index_all = dict(idx_dirs); index_all.update(idx_tsv)
+        print(f"[INDEX-MERGED(test)] 键={len(index_all)}，说话人={len(spk2utts_test)}")
+
+    # 索引 dev
+    with StageTimer("索引(dev)"):
+        dev_spk2utts: Dict[str, List[str]] = {}
+        dev_path2spk: Dict[str, str] = {}
+        dev_index_all: Dict[str, str] = {}
+        if args.dev_search_dirs:
+            dev_index_dirs = build_audio_index_from_dirs(args.dev_search_dirs)
+        else:
+            dev_index_dirs = {}
+        if args.dev_validated_tsv:
+            dev_index_tsv, dev_spk2utts, dev_path2spk = build_audio_index_from_validated(
+                args.dev_validated_tsv, args.audio_root, args.dev_search_dirs)
+        else:
+            dev_index_tsv = {}
+        dev_index_all = dict(dev_index_dirs); dev_index_all.update(dev_index_tsv)
+        print(f"[INDEX-MERGED(dev)] 键={len(dev_index_all)}，说话人={len(dev_spk2utts)}")
+
+    # 生成/读取 trials（test）
+    with StageTimer("准备trials(test)"):
+        pairs: List[Tuple[str, str]] = []
+        labels: Optional[List[int]] = None
+        tau_for_demo = args.threshold
+        if args.auto_trials:
+            if not spk2utts_test:
+                print("[ERROR] --auto_trials 需要能解析说话人（--search_dirs 或 --validated_tsv）。")
+                sys.exit(1)
+            pairs, labels = auto_generate_trials(spk2utts_test,
+                                                pos_per_spk=max(1, args.pos_per_spk),
+                                                neg_per_spk=max(1, args.neg_per_spk),
+                                                max_pairs=max(1, args.max_pairs),
+                                                seed=args.seed)
+            try:
+                save_trials(args.auto_trials_out, pairs, labels)
+            except Exception as e:
+                print(f"[WARN] 保存 auto trials 失败：{e}")
+        elif args.trials:
+            base_hint = os.path.dirname(os.path.abspath(args.trials))
+            pairs, labels = load_trials_with_index(args.trials, index=index_all, base_hint=base_hint)
+            if not pairs:
+                print("[ERROR] trials 解析为空。"); sys.exit(1)
+        else:
+            print("[INFO] 未提供 --trials 且未 --auto_trials，批量评测跳过（仍可做单次匹配）。")
+
+    # dev trials（可选）
+    with StageTimer("准备trials(dev)"):
+        dev_pairs: List[Tuple[str,str]] = []
+        dev_labels: Optional[List[int]] = None
+        if args.dev_trials:
+            base_hint = os.path.dirname(os.path.abspath(args.dev_trials))
+            dev_pairs, dev_labels = load_trials_with_index(args.dev_trials, index=dev_index_all, base_hint=base_hint)
+            if not dev_pairs:
+                print("[WARN] dev_trials 解析为空，将无法进行后端训练/阈值标定。")
+
+    # 明文评测
+    if pairs:
+        with StageTimer("明文评测(test)"):
+            res_float = eval_trials_plaintext_fast(
+                predictor, pairs, labels,
+                save_scores=args.save_scores,
+                report_dir=args.report_dir, tag="",
+                det_probit=args.det_probit, path2spk=path2spk_test,
+                use_cache=args.use_cache, cache_dir=args.cache_dir, raw_model_sig=raw_model_sig
+            )
+            if args.auto_tau and res_float.get("tau_eer") is not None:
+                tau_for_demo = float(res_float["tau_eer"])
+                print(f"[EVAL] 使用 test 集 EER 阈值：{tau_for_demo:.4f}")
+
+        # 固定点 dev 标定 + test 评估
+        with StageTimer("固定点评测(dev->test)"):
+            fp_k, fp_a2, fp_sigma = args.fp_kbits, args.fp_alpha_pow2, args.fp_trunc_sigma
+            tau_eer_dev = tau_for_demo
+            tau_far1_dev = tau_for_demo
+            tau_far0_1_dev = tau_for_demo
+            if dev_pairs and dev_labels:
+                emb_dev = prepare_embeddings(sorted({p for ab in dev_pairs for p in ab}), predictor,
+                                             use_cache=args.use_cache, cache_dir=args.cache_dir, raw_model_sig=raw_model_sig)
+                S_dev = score_pairs_fixed_point(dev_pairs, emb_dev, k_bits=fp_k, alpha_pow2=fp_a2, trunc_sigma=fp_sigma)
+                dev_labels_np = np.array(dev_labels, dtype=np.int32)
+                eerd, _, tau_eer_dev, _, _, _ = compute_eer_mindcf(S_dev, dev_labels_np, progress=True)
+                tau_far1_dev = find_threshold_for_far(S_dev, dev_labels_np, 0.01)
+                tau_far0_1_dev = find_threshold_for_far(S_dev, dev_labels_np, 0.001)
+                print(f"[FIXED-POINT(dev)] EER={eerd:.4f} tau_EER={tau_eer_dev:.4f} tau_1%={tau_far1_dev:.4f} tau_0.1%={tau_far0_1_dev:.4f}")
+            else:
+                print("[FIXED-POINT] 无 dev：固定点阈值回退到 --threshold 或 test EER 阈值。")
+            emb_test = prepare_embeddings(sorted({p for ab in pairs for p in ab}), predictor,
+                                          use_cache=args.use_cache, cache_dir=args.cache_dir, raw_model_sig=raw_model_sig)
+            S_test_fp = score_pairs_fixed_point(pairs, emb_test, k_bits=fp_k, alpha_pow2=fp_a2, trunc_sigma=fp_sigma)
+            if labels is not None:
+                def pack_at_tau(scores, labels, tau):
+                    m = metrics_at_threshold(scores, np.array(labels), tau); m["tau"]=tau; return m
+                fp_res = {
+                    "fixed_point": {"k_bits": fp_k, "alpha_pow2": fp_a2, "trunc_sigma": fp_sigma},
+                    "dev_tau": {"EER": tau_eer_dev, "FAR1": tau_far1_dev, "FAR0_1": tau_far0_1_dev},
+                    "test_at_dev_EER": pack_at_tau(S_test_fp, labels, tau_eer_dev),
+                    "test_at_dev_FAR1": pack_at_tau(S_test_fp, labels, tau_far1_dev),
+                    "test_at_dev_FAR0_1": pack_at_tau(S_test_fp, labels, tau_far0_1_dev),
+                }
+                save_metrics_json(args.report_dir, fp_res, tag="_fixedpoint_devcal")
+
+        # 基线/消融（后端训练只用 dev）
+        with StageTimer("基线/消融"):
+            emb_backend = None
+            if ("lda" in args.baselines or "plda" in args.baselines):
+                if dev_pairs:
+                    backend_paths = sorted({p for ab in dev_pairs for p in ab})
+                    emb_backend = prepare_embeddings(backend_paths, predictor,
+                                                     use_cache=args.use_cache, cache_dir=args.cache_dir, raw_model_sig=raw_model_sig)
+                elif dev_spk2utts:
+                    backend_paths = sorted({u for us in dev_spk2utts.values() for u in us})
+                    emb_backend = prepare_embeddings(backend_paths, predictor,
+                                                     use_cache=args.use_cache, cache_dir=args.cache_dir, raw_model_sig=raw_model_sig)
+                else:
+                    print("[BASELINE] 无 dev 数据，后端训练跳过。")
+            if args.baselines:
+                run_baselines(predictor, pairs, labels, spk2utts_test,
+                              report_dir=args.report_dir,
+                              modes=args.baselines,
+                              pca_dim=args.pca_dim,
+                              quantize=args.quantize,
+                              salt_mode=args.salt_mode,
+                              salt=args.salt, salt_eps=args.salt_eps,
+                              emb_backend=emb_backend,
+                              spk2utts_dev=dev_spk2utts if dev_spk2utts else None,
+                              path2spk_test=path2spk_test,
+                              det_probit=args.det_probit,
+                              use_cache=args.use_cache, cache_dir=args.cache_dir, raw_model_sig=raw_model_sig)
+
+        # 错盐评估
+        with StageTimer("错盐不可链接"):
+            if args.cross_salt_eval:
+                if args.salt_mode not in {"orth", "signperm", "additive"} or not args.salt or not args.salt2:
+                    print("[CROSS-SALT] 需要 --salt_mode 与两把盐：--salt 与 --salt2")
+                elif labels is None:
+                    print("[CROSS-SALT] 需要标签以区分 genuine/impostor。")
+                else:
+                    eval_cross_salt_unlinkability(
+                        pairs=pairs, labels=labels, predictor=predictor,
+                        report_dir=args.report_dir,
+                        pca_dim=args.pca_dim, quantize=args.quantize,
+                        salt_mode=args.salt_mode, salt1=args.salt, salt2=args.salt2,
+                        salt_eps=args.salt_eps, use_cache=args.use_cache, cache_dir=args.cache_dir, raw_model_sig=raw_model_sig
+                    )
+
+        # 鲁棒性
+        with StageTimer("鲁棒性(噪声/截断)"):
+            if (args.robust_noise or args.robust_len):
+                if labels is None:
+                    print("[ROBUST] 缺少标签，EER 评估跳过。")
+                else:
+                    eval_robust(predictor, pairs, labels, args.report_dir,
+                                args.robust_noise or [], args.robust_len or [],
+                                crop_mode=args.crop_mode, path2spk=path2spk_test, det_probit=args.det_probit,
+                                use_cache=args.use_cache, cache_dir=args.cache_dir, raw_model_sig=raw_model_sig)
+
+        # 规模扩展
+        with StageTimer("规模扩展(EER~#spk)"):
+            if args.scale_speakers:
+                eval_scale_speakers(predictor, spk2utts_test, args.report_dir, args.scale_speakers,
+                                    path2spk=path2spk_test, det_probit=args.det_probit,
+                                    use_cache=args.use_cache, cache_dir=args.cache_dir, raw_model_sig=raw_model_sig)
+
+        # 嵌入计时
+        with StageTimer("嵌入计时(profile)"):
+            if args.profile_embed > 0:
+                uniq_utts = sorted(list({p for ab in pairs for p in ab}))
+                K = min(args.profile_embed, len(uniq_utts))
+                t = []
+                for i in pb_iter(range(K), desc="embed-time", total=K) if HAS_TQDM else range(K):
+                    t0 = time.time(); _ = get_embedding(predictor, uniq_utts[i]); t.append(time.time()-t0)
+                t = np.array(t)
+                print(f"[EMBED] N={K} avg={t.mean()*1000:.2f}ms p50={np.percentile(t,50)*1000:.2f}ms "
+                      f"p90={np.percentile(t,90)*1000:.2f}ms p99={np.percentile(t,99)*1000:.2f}ms")
+
+        # MPC 匹配压测 + CDF/通信
+        with StageTimer("MPC匹配压测+图"):
+            if args.profile_mpc > 0:
+                backend = args.backend
+                K = min(args.profile_mpc, len(pairs))
+                print(f"[MPC] 压测 backend={backend}, N={K}, tau={tau_for_demo:.4f}")
+                uniq = sorted(list({p for ab in pairs for p in ab}))
+                emb_cache = prepare_embeddings(uniq, predictor,
+                                               use_cache=args.use_cache, cache_dir=args.cache_dir, raw_model_sig=raw_model_sig)
+                emb_pairs = [(emb_cache[a], emb_cache[b]) for a,b in pairs[:K]]
+                times = profile_mpc_matching_only(emb_pairs, tau_for_demo, backend, K)
+                if args.cdf_latency and HAS_MPL:
+                    out_png = os.path.join(args.report_dir, "latency_cdf.png")
+                    plot_latency_cdf(times, out_png)
+                if args.comm_plot and HAS_MPL:
+                    d = len(next(iter(emb_cache.values())))
+                    out_png = os.path.join(args.report_dir, "comm_bar.png")
+                    plot_comm_bar(d, out_png, k_bits=args.fp_kbits)
+
+    # 单次匹配
+    with StageTimer("单次匹配"):
+        if args.audio1 and args.audio2:
+            def resolve_one(a: str) -> Optional[str]:
+                if os.path.exists(a): return a
+                return index_all.get(a) or index_all.get(os.path.splitext(a)[0])
+            a1 = resolve_one(args.audio1); a2 = resolve_one(args.audio2)
+            if not a1 or not os.path.exists(a1):
+                print(f"[ERROR] audio1 无效：{args.audio1}"); sys.exit(2)
+            if not a2 or not os.path.exists(a2):
+                print(f"[ERROR] audio2 无效：{args.audio2}"); sys.exit(2)
+            print(f"[MPC] 后端：{args.backend}，阈值：{(args.threshold):.4f}")
+            if args.backend == "local":
+                score, same = mpc_compare_local(predictor, a1, a2, args.threshold)
+            else:
+                score, same = mpc_compare_crypten(predictor, a1, a2, args.threshold)
+            print(f"[MPC-{args.backend}] 相似度：{score:.6f} -> 判定：{'同一人' if same else '不同人'}（阈值 {args.threshold:.4f}）")
+
+    # PAD（可选，默认不跑）
+    with StageTimer("PAD(可选)"):
+        if args.enable_pad:
+            if HAS_PAD and PADPredictor is not None:
+                try:
+                    pad_model = PADPredictor()
+                except Exception as e:
+                    print(f"[PAD] 初始化失败：{e}")
+                    pad_model = None
+            else:
+                pad_model = None
+                print("[PAD] 未检测到 PADPredictor（mvector.pad），跳过。")
+            if pad_model and args.pad_trials:
+                eval_pad(pad_model, args.pad_trials, index_all, args.report_dir, tag="_pad")
+            else:
+                if args.pad_trials:
+                    print("[PAD] pad_trials 已给，但没有可用 PAD 预测器，跳过。")
+
+    # 运行元数据 + 阶段计时
+    with StageTimer("保存元数据/计时"):
+        extras = {
+            "validated_tsv_hash": safe_hash_file(args.validated_tsv) if args.validated_tsv else None,
+            "trials_hash": safe_hash_file(args.trials) if args.trials else None,
+            "dev_validated_tsv_hash": safe_hash_file(args.dev_validated_tsv) if args.dev_validated_tsv else None,
+            "dev_trials_hash": safe_hash_file(args.dev_trials) if args.dev_trials else None,
+        }
+        collect_env_metadata(args, args.report_dir, extras)
+        save_stage_times(args.report_dir)
+
+if __name__ == "__main__":
+    main()
